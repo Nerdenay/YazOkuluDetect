@@ -1,0 +1,268 @@
+<Window x:Class="YazOkuluDetectUI.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:local="clr-namespace:YazOkuluDetectUI"
+        mc:Ignorable="d"
+        Title="Yapay Zeka Destekli Onkolojik BT Analizi &amp; RECIST 1.1 Karar Destek Sistemi" 
+        Height="760" Width="1280"
+        Background="#0F172A" WindowStartupLocation="CenterScreen">
+
+    <Window.Resources>
+        <!-- Modern Stiller -->
+        <Style TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#F8FAFC"/>
+            <Setter Property="FontFamily" Value="Segoe UI"/>
+        </Style>
+
+        <Style x:Key="HeaderCard" TargetType="Border">
+            <Setter Property="Background" Value="#1E293B"/>
+            <Setter Property="CornerRadius" Value="8"/>
+            <Setter Property="Padding" Value="16,12"/>
+            <Setter Property="Margin" Value="0,0,0,16"/>
+        </Style>
+
+        <Style x:Key="CardBorder" TargetType="Border">
+            <Setter Property="Background" Value="#1E293B"/>
+            <Setter Property="BorderBrush" Value="#334155"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="CornerRadius" Value="8"/>
+            <Setter Property="Padding" Value="16"/>
+            <Setter Property="Margin" Value="0,0,0,16"/>
+        </Style>
+
+        <Style TargetType="Button">
+            <Setter Property="Background" Value="#0284C7"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Padding" Value="12,8"/>
+            <Setter Property="Margin" Value="0,4"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Style.Resources>
+                <Style TargetType="Border">
+                    <Setter Property="CornerRadius" Value="6"/>
+                </Style>
+            </Style.Resources>
+        </Style>
+    </Window.Resources>
+
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <!-- Header -->
+            <RowDefinition Height="Auto"/>
+            <!-- Main Content (2 Column Layout) -->
+            <RowDefinition Height="*"/>
+            <!-- Footer Status Bar -->
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Üst Başlık (Header) -->
+        <Border Grid.Row="0" Style="{StaticResource HeaderCard}">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                
+                <StackPanel Orientation="Vertical">
+                    <TextBlock Text="Yapay Zeka Destekli Onkolojik BT Analizi &amp; RECIST 1.1 Karar Destek Sistemi" 
+                               FontSize="18" FontWeight="Bold" Foreground="#38BDF8"/>
+                    <TextBlock Text="Longitudinal Lezyon Takibi ve Otomatik Karar Motoru" 
+                               FontSize="12" Foreground="#94A3B8" Margin="0,2,0,0"/>
+                </StackPanel>
+
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Border Background="#064E3B" CornerRadius="12" Padding="10,4" Margin="0,0,8,0">
+                        <StackPanel Orientation="Horizontal">
+                            <Ellipse Width="8" Height="8" Fill="#34D399" Margin="0,0,6,0"/>
+                            <TextBlock x:Name="TxtApiStatus" Text="Python API: Bağlı (http://127.0.0.1:8000)" 
+                                       FontSize="11" Foreground="#34D399" FontWeight="Medium"/>
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- Ana İçerik (Sol Panel & Sağ Panel) -->
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="380"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- SOL PANEL: Veri Yükleme ve İşlem Kontrolleri -->
+            <ScrollViewer Grid.Column="0" VerticalScrollBarVisibility="Auto" Margin="0,0,8,0">
+                <StackPanel Orientation="Vertical">
+                    
+                    <!-- 1. DICOM Seçim Kartı -->
+                    <Border Style="{StaticResource CardBorder}">
+                        <StackPanel>
+                            <TextBlock Text="1. DICOM Tetkik Seçimi" FontSize="14" FontWeight="Bold" Foreground="#F8FAFC" Margin="0,0,0,12"/>
+                            
+                            <TextBlock Text="DICOM Klasör Yolu:" FontSize="12" Foreground="#CBD5E1" Margin="0,0,0,4"/>
+                            <Grid Margin="0,0,0,8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBox x:Name="TxtDicomPath" Background="#0F172A" Foreground="#F8FAFC" BorderBrush="#334155" 
+                                         Padding="8,6" VerticalAlignment="Center" FontSize="11" IsReadOnly="True"
+                                         Text="Henüz klasör seçilmedi..."/>
+                                <Button Grid.Column="1" Content="Gözat..." Margin="4,0,0,0" Click="BtnBrowseDicom_Click" Background="#334155"/>
+                            </Grid>
+
+                            <!-- Otomatik Okunan Metadata Kartı -->
+                            <Border Background="#0F172A" CornerRadius="6" Padding="10" Margin="0,4,0,0">
+                                <StackPanel>
+                                    <TextBlock Text="📋 DICOM Üstveri Bilgileri:" FontSize="11" FontWeight="Bold" Foreground="#38BDF8" Margin="0,0,0,6"/>
+                                    <TextBlock x:Name="TxtPatientId" Text="Hasta ID: -" FontSize="11" Foreground="#94A3B8"/>
+                                    <TextBlock x:Name="TxtPatientName" Text="Hasta Adı: -" FontSize="11" Foreground="#94A3B8" Margin="0,2,0,0"/>
+                                    <TextBlock x:Name="TxtStudyDate" Text="Çekim Tarihi: -" FontSize="11" Foreground="#94A3B8" Margin="0,2,0,0"/>
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- 2. AI İşlem Kontrol Kartı -->
+                    <Border Style="{StaticResource CardBorder}">
+                        <StackPanel>
+                            <TextBlock Text="2. Analiz &amp; Pipeline Adımları" FontSize="14" FontWeight="Bold" Foreground="#F8FAFC" Margin="0,0,0,12"/>
+                            
+                            <Button x:Name="BtnPreprocess" Content="⚙️ 1. DICOM Ön İşleme (NIfTI &amp; Resample)" Click="BtnPreprocess_Click"/>
+                            <Button x:Name="BtnPredict" Content="🧠 2. AI Segmentasyon Tahmini (Mock)" Click="BtnPredict_Click" Background="#475569"/>
+                            
+                            <Separator Background="#334155" Margin="0,8"/>
+                            
+                            <TextBlock Text="RECIST Karar Testi (Manuel Giriş):" FontSize="11" Foreground="#CBD5E1" Margin="0,4,0,4"/>
+                            <Grid Margin="0,0,0,4">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Grid.Column="0" Margin="0,0,4,0">
+                                    <TextBlock Text="Baz SOD (mm):" FontSize="10" Foreground="#94A3B8"/>
+                                    <TextBox x:Name="TxtBaselineSod" Text="50.0" Background="#0F172A" Foreground="White" BorderBrush="#334155" Padding="4"/>
+                                </StackPanel>
+                                <StackPanel Grid.Column="1" Margin="4,0,0,0">
+                                    <TextBlock Text="Kontrol SOD (mm):" FontSize="10" Foreground="#94A3B8"/>
+                                    <TextBox x:Name="TxtFollowupSod" Text="62.0" Background="#0F172A" Foreground="White" BorderBrush="#334155" Padding="4"/>
+                                </StackPanel>
+                            </Grid>
+
+                            <CheckBox x:Name="ChkNewLesion" Content="Yeni lezyon tespit edildi" Foreground="#F8FAFC" Margin="0,6,0,8" FontSize="11"/>
+
+                            <Button x:Name="BtnRunRecist" Content="📊 3. RECIST 1.1 Kararını Hesapla" Click="BtnRunRecist_Click" Background="#059669"/>
+                        </StackPanel>
+                    </Border>
+
+                </StackPanel>
+            </ScrollViewer>
+
+            <!-- SAĞ PANEL: Sonuç Dashboard ve Rapor Paneli -->
+            <Grid Grid.Column="1" Margin="8,0,0,0">
+                <Grid.RowDefinitions>
+                    <!-- Karar Rozeti ve Özet -->
+                    <RowDefinition Height="Auto"/>
+                    <!-- Rapor ve Detaylar -->
+                    <RowDefinition Height="*"/>
+                    <!-- Sistem Konsolu / Log -->
+                    <RowDefinition Height="180"/>
+                </Grid.RowDefinitions>
+
+                <!-- RECIST 1.1 Karar Kartı -->
+                <Border Grid.Row="0" x:Name="BorderDecisionCard" Style="{StaticResource CardBorder}" Background="#1E293B">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+
+                        <!-- Büyük Karar Rozeti -->
+                        <Border Grid.Column="0" x:Name="BadgeDecision" Background="#DC2626" CornerRadius="8" Width="100" Height="80" Margin="0,0,16,0" VerticalAlignment="Center">
+                            <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center">
+                                <TextBlock x:Name="TxtDecisionBadge" Text="PD" FontSize="32" FontWeight="Bold" Foreground="White" HorizontalAlignment="Center"/>
+                                <TextBlock Text="RECIST 1.1" FontSize="9" Foreground="#FCA5A5" HorizontalAlignment="Center"/>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- Karar Açıklaması -->
+                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                            <TextBlock x:Name="TxtDecisionTitle" Text="Progressive Disease (İlerleyen Hastalık)" FontSize="16" FontWeight="Bold" Foreground="#F8FAFC"/>
+                            <TextBlock x:Name="TxtDecisionExplanation" Text="Tümör yükünde en az %20 ve mutlak olarak en az 5mm artış tespit edildi." 
+                                       FontSize="12" Foreground="#CBD5E1" TextWrapping="Wrap" Margin="0,4,0,0"/>
+                            
+                            <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                                <TextBlock x:Name="TxtBaselineSummary" Text="Baz SOD: 50.0 mm" FontSize="11" Foreground="#94A3B8" Margin="0,0,16,0"/>
+                                <TextBlock x:Name="TxtFollowupSummary" Text="Kontrol SOD: 62.0 mm" FontSize="11" Foreground="#94A3B8" Margin="0,0,16,0"/>
+                                <TextBlock x:Name="TxtChangeSummary" Text="Değişim: +%24.0" FontSize="11" FontWeight="Bold" Foreground="#F87171"/>
+                            </StackPanel>
+                        </StackPanel>
+                    </Grid>
+                </Border>
+
+                <!-- Detaylı Klinik Rapor ve BT Kesit Görselleştirme Görünümü -->
+                <Border Grid.Row="1" Style="{StaticResource CardBorder}">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+
+                        <!-- Sol Sütun: BT Kesit Görseli Paneli -->
+                        <Grid Grid.Column="0" Margin="0,0,8,0">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="*"/>
+                            </Grid.RowDefinitions>
+                            <TextBlock Text="🖼️ 2D BT Kesiti &amp; AI Lezyon Etiketleri" FontSize="13" FontWeight="Bold" Foreground="#38BDF8" Margin="0,0,0,8"/>
+                            <Border Grid.Row="1" Background="#0F172A" BorderBrush="#334155" BorderThickness="1" CornerRadius="6" Padding="4">
+                                <Grid>
+                                    <TextBlock x:Name="TxtImagePlaceholder" Text="BT Kesit ve Lezyon Etiket Görseli İşlem Sonrasında Burada Görüntülenecek" 
+                                               Foreground="#64748B" FontSize="11" TextWrapping="Wrap" TextAlignment="Center" 
+                                               VerticalAlignment="Center" HorizontalAlignment="Center" Margin="16"/>
+                                    <Image x:Name="ImgSliceViewer" Stretch="Uniform" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                </Grid>
+                            </Border>
+                        </Grid>
+
+                        <!-- Sağ Sütun: Klinik Rapor Metni -->
+                        <Grid Grid.Column="1" Margin="8,0,0,0">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="*"/>
+                            </Grid.RowDefinitions>
+                            <TextBlock Text="📄 Otomatik Klinik Rapor Taslağı" FontSize="13" FontWeight="Bold" Foreground="#38BDF8" Margin="0,0,0,8"/>
+                            <TextBox Grid.Row="1" x:Name="TxtReportOutput" Background="#0F172A" Foreground="#E2E8F0" BorderBrush="#334155" 
+                                     AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" FontSize="11" FontFamily="Consolas" Padding="8"
+                                     Text="Sistem henüz bir analiz gerçekleştirmedi. Sol paneli kullanarak bir test başlatın..."/>
+                        </Grid>
+                    </Grid>
+                </Border>
+
+                <!-- Sistem Günlüğü / Log Console -->
+                <Border Grid.Row="2" Style="{StaticResource CardBorder}" Margin="0,8,0,0">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+                        <TextBlock Text="💻 Sistem Günlüğü (Console Log)" FontSize="11" FontWeight="Bold" Foreground="#94A3B8" Margin="0,0,0,4"/>
+                        <ListBox Grid.Row="1" x:Name="LstLogs" Background="#0F172A" Foreground="#34D399" BorderBrush="#334155" 
+                                 FontSize="10" FontFamily="Consolas" Padding="4"/>
+                    </Grid>
+                </Border>
+
+            </Grid>
+        </Grid>
+
+        <!-- Footer Bar -->
+        <Border Grid.Row="2" Background="#1E293B" CornerRadius="4" Padding="8,4" Margin="0,8,0,0">
+            <Grid>
+                <TextBlock Text="RECIST 1.1 Karar Destek Sistemi v1.0 — Antigravity IDE" FontSize="10" Foreground="#64748B"/>
+                <TextBlock Text="Durum: Hazır" FontSize="10" Foreground="#64748B" HorizontalAlignment="Right"/>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>

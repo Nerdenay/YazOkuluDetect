@@ -1,0 +1,49 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Model Ağırlıkları (Büyük dosyalar, ayrı yönetilir)
+models/
+*.pth
+*.pt
+*.onnx
+*.pkl
+
+# İşlenmiş NIfTI ve Çıktı Dosyaları (Hasta verisi - paylaşılmaz)
+output/
+*.nii
+*.nii.gz
+
+# nnU-Net Veri Dizinleri (Ham hasta verisi)
+nnunet_data/
+my_raw_data/
+
+# IDE ve Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# C# Build Çıktıları
+YazOkuluDetectUI/bin/
+YazOkuluDetectUI/obj/
+
+# Log Dosyaları
+*.log
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Ortam Değişkenleri (API Anahtarları - KESİNLİKLE paylaşılmaz)
+.env
+*.env
+secrets.json
