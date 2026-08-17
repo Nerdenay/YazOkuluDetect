@@ -8,32 +8,53 @@ using System.Windows;
 using System.Windows.Media;
 using FellowOakDicom;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 namespace YazOkuluDetectUI
 {
     public partial class MainWindow : Window
     {
-        // FastAPI Backend Sunucu Adresi
+        // ─── SABİTLER ────────────────────────────────────────────────────────
         private const string ApiBaseUrl = "http://127.0.0.1:8000";
-        private readonly HttpClient _httpClient = new HttpClient();
 
-        private string _selectedDicomDir = string.Empty;
-        private string _lastProcessedNifti = string.Empty;
+        // ─── DURUM DEĞİŞKENLERİ ─────────────────────────────────────────────
+        private readonly HttpClient _httpClient = new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
 
+        // Mevcut mod: "single" veya "longitudinal"
+        private string _mode = "single";
+
+        // Tek tetkik modu için seçili klasör
+        private string _singleDicomDir = string.Empty;
+
+        // Longitudinal mod için seçili klasörler
+        private string _baselineDicomDir  = string.Empty;
+        private string _followupDicomDir  = string.Empty;
+
+        // t0 ve t1 Hasta ID'leri (aynı hasta doğrulaması için)
+        private string _baselinePatientId = string.Empty;
+        private string _followupPatientId = string.Empty;
+
+        // ─── KURUCU ─────────────────────────────────────────────────────────
         public MainWindow()
         {
             InitializeComponent();
-            Log("Uygulama başlatıldı. FastAPI bağlantısı kontrol ediliyor...");
+            Log("Uygulama başlatıldı. FastAPI backend bağlantısı kontrol ediliyor...");
             _ = CheckApiConnectionAsync();
         }
 
+        // ====================================================================
+        //  YARDIMCI: LOG
+        // ====================================================================
         private void Log(string message)
         {
-            string timestamp = DateTime.Now.ToString("HH:mm:ss");
-            LstLogs.Items.Add($"[{timestamp}] {message}");
+            string ts = DateTime.Now.ToString("HH:mm:ss");
+            LstLogs.Items.Add($"[{ts}] {message}");
             LstLogs.ScrollIntoView(LstLogs.Items[LstLogs.Items.Count - 1]);
         }
 
+        // ====================================================================
+        //  API BAĞLANTI KONTROLÜ
+        // ====================================================================
         private async Task CheckApiConnectionAsync()
         {
             try
@@ -43,214 +64,472 @@ namespace YazOkuluDetectUI
                 {
                     TxtApiStatus.Text = "Python API: Bağlı (http://127.0.0.1:8000)";
                     Log("FastAPI sunucusuyla bağlantı kuruldu.");
+
+                    // Model ağırlığı var mı kontrol et
+                    await CheckAiModeAsync();
                 }
                 else
                 {
                     TxtApiStatus.Text = "Python API: Yanıt Vermiyor";
-                    Log("UYARI: FastAPI sunucusu yanıt vermedi.");
+                    BadgeApi.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#7F1D1D"));
+                    EllApiDot.Fill = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#EF4444"));
+                    TxtApiStatus.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#FCA5A5"));
+                    Log("UYARI: FastAPI sunucusu yanıt vermedi. Backend'i başlatın!");
                 }
             }
             catch (Exception ex)
             {
                 TxtApiStatus.Text = "Python API: Bağlantı Hatası!";
+                BadgeApi.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#7F1D1D"));
+                EllApiDot.Fill = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#EF4444"));
+                TxtApiStatus.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#FCA5A5"));
                 Log($"HATA: API sunucusuna erişilemedi. ({ex.Message})");
             }
         }
 
-        private void BtnBrowseDicom_Click(object sender, RoutedEventArgs e)
+        /// <summary>Modeller klasöründe eğitilmiş ağırlık dosyası var mı kontrol eder ve AI modu rozetini günceller.</summary>
+        private async Task CheckAiModeAsync()
         {
-            // .NET 8 WPF yerel klasör seçici
-            var dialog = new Microsoft.Win32.OpenFolderDialog
+            // Backend'e küçük bir istek atarak yanıt gövdesindeki bilgiye ulaşıyoruz.
+            // Alternatif: ./models klasörünü yerel olarak da kontrol edebiliriz.
+            string modelsDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "..", "..", "models");
+            bool hasWeights = Directory.Exists(modelsDir) &&
+                              Directory.GetFiles(modelsDir, "*.pth").Length > 0;
+
+            await Dispatcher.InvokeAsync(() =>
             {
-                Title = "DICOM Tetkik Klasörünü Seçin"
-            };
-
-            if (dialog.ShowDialog() == true)
-            {
-                _selectedDicomDir = dialog.FolderName;
-                TxtDicomPath.Text = _selectedDicomDir;
-                Log($"DICOM Klasörü seçildi: {_selectedDicomDir}");
-
-                // fo-dicom ile klasördeki ilk DICOM dosyasının metadatasını oku
-                ReadDicomMetadata(_selectedDicomDir);
-            }
-        }
-
-        private void ReadDicomMetadata(string dirPath)
-        {
-            try
-            {
-                // Klasördeki tüm dosyaları (tüm alt klasörler dahil) tara
-                var allFiles = Directory.GetFiles(dirPath, "*.*", SearchOption.AllDirectories)
-                                        .Where(f => !f.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) && 
-                                                    !f.EndsWith(".txt", StringComparison.OrdinalIgnoreCase) &&
-                                                    !f.EndsWith(".json", StringComparison.OrdinalIgnoreCase) &&
-                                                    !Path.GetFileName(f).Equals("DICOMDIR", StringComparison.OrdinalIgnoreCase))
-                                        .ToArray();
-
-                bool foundValidDicom = false;
-
-                foreach (var file in allFiles)
+                if (hasWeights)
                 {
-                    try
-                    {
-                        var dicomFile = DicomFile.Open(file);
-                        var dataset = dicomFile.Dataset;
-
-                        string patId = dataset.GetSingleValueOrDefault(DicomTag.PatientID, "Bilinmiyor");
-                        string patName = dataset.GetSingleValueOrDefault(DicomTag.PatientName, "Bilinmiyor");
-                        string studyDate = dataset.GetSingleValueOrDefault(DicomTag.StudyDate, "Bilinmiyor");
-
-                        TxtPatientId.Text = $"Hasta ID: {patId}";
-                        TxtPatientName.Text = $"Hasta Adı: {patName}";
-                        TxtStudyDate.Text = $"Çekim Tarihi: {studyDate}";
-
-                        Log($"DICOM Üstveri okundu -> Hasta: {patName} ({patId}), Tarih: {studyDate}");
-                        foundValidDicom = true;
-                        break; // İlk geçerli DICOM dosyasını bulunca üstveriyi alıp çıkıyoruz
-                    }
-                    catch
-                    {
-                        // Bu dosya DICOM formatında değilse sonraki dosyayı dene
-                        continue;
-                    }
-                }
-
-                if (!foundValidDicom)
-                {
-                    TxtPatientId.Text = "Hasta ID: Klasör Seçildi";
-                    TxtPatientName.Text = "Hasta Adı: (Klasör Algılandı)";
-                    TxtStudyDate.Text = "Çekim Tarihi: -";
-                    Log("DICOM Klasörü seçildi. (Ön İşleme adımı için hazırdır).");
-                }
-            }
-            catch (Exception ex)
-            {
-                Log($"DICOM okuma uyarısı: {ex.Message}");
-            }
-        }
-
-        private async void BtnPreprocess_Click(object sender, RoutedEventArgs e)
-        {
-            if (string.IsNullOrEmpty(_selectedDicomDir) || !Directory.Exists(_selectedDicomDir))
-            {
-                MessageBox.Show("Lütfen önce geçerli bir DICOM klasörü seçin.", "Uyarı", MessageBoxButton.OK, MessageBoxImage.Warning);
-                return;
-            }
-
-            Log("Ön işleme isteği FastAPI'ye gönderiliyor...");
-            BtnPreprocess.IsEnabled = false;
-
-            try
-            {
-                string outputDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Output");
-                string outputFilename = "processed_study.nii.gz";
-
-                var requestBody = new
-                {
-                    dicom_dir = _selectedDicomDir,
-                    output_dir = outputDir,
-                    output_filename = outputFilename
-                };
-
-                string jsonContent = JsonConvert.SerializeObject(requestBody);
-                var content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
-
-                var response = await _httpClient.PostAsync($"{ApiBaseUrl}/preprocess", content);
-                string responseStr = await response.Content.ReadAsStringAsync();
-
-                if (response.IsSuccessStatusCode)
-                {
-                    var result = Newtonsoft.Json.Linq.JObject.Parse(responseStr);
-                    _lastProcessedNifti = result["file_path"]?.ToString() ?? string.Empty;
-                    string spacing = result["spacing"]?.ToString() ?? "";
-                    string size = result["size"]?.ToString() ?? "";
-
-                    Log($"[BAŞARILI] Ön işleme tamamlandı: {_lastProcessedNifti}");
-                    Log($"Resampled Spacing: {spacing}");
-
-                    TxtReportOutput.Text = $"=== ÖN İŞLEME RAPORU ===\n\n" +
-                                           $"Çıktı Dosyası: {_lastProcessedNifti}\n" +
-                                           $"Hedef Spacing: [1.0mm, 1.0mm, 1.0mm]\n" +
-                                           $"Görüntü Boyutları: {size}\n\n" +
-                                           $"Görüntü başarıyla NIfTI formatına çevrildi ve normalizasyon uygulandı.";
+                    TxtAiMode.Text = "Gerçek AI Modu (nnU-Net)";
+                    TxtAiModeIcon.Text = "🧠";
+                    BadgeAiMode.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#064E3B"));
+                    TxtAiMode.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#34D399"));
                 }
                 else
                 {
-                    Log($"HATA: Preprocess isteği başarısız oldu. ({responseStr})");
+                    TxtAiMode.Text = "Test Modu (Model Eğitilmemiş)";
+                    TxtAiModeIcon.Text = "🔧";
                 }
-            }
-            catch (Exception ex)
+            });
+        }
+
+        // ====================================================================
+        //  MOD SEÇİCİ
+        // ====================================================================
+        private void BtnModeSingle_Click(object sender, RoutedEventArgs e)
+        {
+            SetMode("single");
+        }
+
+        private void BtnModeLongitudinal_Click(object sender, RoutedEventArgs e)
+        {
+            SetMode("longitudinal");
+        }
+
+        private void SetMode(string mode)
+        {
+            _mode = mode;
+
+            if (mode == "single")
             {
-                Log($"HATA: İletişim hatası. ({ex.Message})");
+                BtnModeSingle.Style       = (Style)FindResource("TabBtnActive");
+                BtnModeLongitudinal.Style = (Style)FindResource("TabBtn");
+                PanelSingle.Visibility       = Visibility.Visible;
+                PanelLongitudinal.Visibility = Visibility.Collapsed;
+                TxtModeDescription.Text = "Tek bir BT taraması için lezyon tespiti ve sınıflandırma yapın.";
+                BtnAnalyze.Content = "🔬  Analizi Başlat";
+                UpdateAnalyzeButtonState();
+            }
+            else
+            {
+                BtnModeSingle.Style       = (Style)FindResource("TabBtn");
+                BtnModeLongitudinal.Style = (Style)FindResource("TabBtnActive");
+                PanelSingle.Visibility       = Visibility.Collapsed;
+                PanelLongitudinal.Visibility = Visibility.Visible;
+                TxtModeDescription.Text = "İki farklı tarihteki BT taramalarını karşılaştırarak RECIST 1.1 kararı üretin.";
+                BtnAnalyze.Content = "📊  Longitudinal Analizi Başlat";
+                UpdateAnalyzeButtonState();
+            }
+        }
+
+        // ====================================================================
+        //  KLASÖR GÖZAT ve DICOM METADATA OKUMA
+        // ====================================================================
+        private void BtnBrowseSingle_Click(object sender, RoutedEventArgs e)
+        {
+            var folder = BrowseFolder("BT Tetkik DICOM Klasörünü Seçin");
+            if (folder == null) return;
+            _singleDicomDir = folder;
+            TxtDicomPath.Text = folder;
+            var meta = ReadDicomMetadata(folder);
+            TxtSinglePatientId.Text   = $"Hasta ID: {meta.Id}";
+            TxtSinglePatientName.Text = $"Hasta Adı: {meta.Name}";
+            TxtSingleStudyDate.Text   = $"Çekim Tarihi: {meta.Date}";
+            Log($"Tek Tetkik: {meta.Name} ({meta.Id}), Tarih: {meta.Date}");
+            UpdateAnalyzeButtonState();
+        }
+
+        private void BtnBrowseBaseline_Click(object sender, RoutedEventArgs e)
+        {
+            var folder = BrowseFolder("Baseline (t₀) DICOM Klasörünü Seçin");
+            if (folder == null) return;
+            _baselineDicomDir = folder;
+            TxtBaselinePath.Text = folder;
+            var meta = ReadDicomMetadata(folder);
+            _baselinePatientId = meta.Id;
+            TxtBaselinePatientId.Text   = $"Hasta ID: {meta.Id}";
+            TxtBaselinePatientName.Text = $"Hasta Adı: {meta.Name}";
+            TxtBaselineStudyDate.Text   = $"Çekim Tarihi: {meta.Date}";
+            Log($"t₀ Baseline: {meta.Name} ({meta.Id}), Tarih: {meta.Date}");
+            ValidatePatientMatch();
+            UpdateAnalyzeButtonState();
+        }
+
+        private void BtnBrowseFollowup_Click(object sender, RoutedEventArgs e)
+        {
+            var folder = BrowseFolder("Follow-up (t₁) DICOM Klasörünü Seçin");
+            if (folder == null) return;
+            _followupDicomDir = folder;
+            TxtFollowupPath.Text = folder;
+            var meta = ReadDicomMetadata(folder);
+            _followupPatientId = meta.Id;
+            TxtFollowupPatientId.Text   = $"Hasta ID: {meta.Id}";
+            TxtFollowupPatientName.Text = $"Hasta Adı: {meta.Name}";
+            TxtFollowupStudyDate.Text   = $"Çekim Tarihi: {meta.Date}";
+            Log($"t₁ Follow-up: {meta.Name} ({meta.Id}), Tarih: {meta.Date}");
+            ValidatePatientMatch();
+            UpdateAnalyzeButtonState();
+        }
+
+        /// <summary>Klasör seçici dialog'u açar ve seçilen yolu döner. İptal edilirse null döner.</summary>
+        private string? BrowseFolder(string title)
+        {
+            var dialog = new Microsoft.Win32.OpenFolderDialog { Title = title };
+            return (dialog.ShowDialog() == true) ? dialog.FolderName : null;
+        }
+
+        // ====================================================================
+        //  HASTA KİMLİĞİ DOĞRULAMASI (LONGİTUDİNAL MOD)
+        // ====================================================================
+        private void ValidatePatientMatch()
+        {
+            if (string.IsNullOrEmpty(_baselinePatientId) || string.IsNullOrEmpty(_followupPatientId))
+            {
+                BorderPatientMismatch.Visibility = Visibility.Collapsed;
+                BorderPatientMatch.Visibility    = Visibility.Collapsed;
+                return;
+            }
+
+            bool match = string.Equals(_baselinePatientId.Trim(), _followupPatientId.Trim(),
+                                       StringComparison.OrdinalIgnoreCase);
+
+            if (match)
+            {
+                BorderPatientMismatch.Visibility = Visibility.Collapsed;
+                BorderPatientMatch.Visibility    = Visibility.Visible;
+                TxtPatientMatch.Text = $"✅ Aynı hasta doğrulandı (ID: {_baselinePatientId}). Longitudinal analiz hazır.";
+                Log($"Hasta ID eşleşmesi doğrulandı: {_baselinePatientId}");
+            }
+            else
+            {
+                BorderPatientMatch.Visibility    = Visibility.Collapsed;
+                BorderPatientMismatch.Visibility = Visibility.Visible;
+                TxtPatientMismatch.Text = $"⚠️ Hasta ID uyuşmuyor! t₀: [{_baselinePatientId}] — t₁: [{_followupPatientId}]. Devam etmek istiyor musunuz?";
+                Log($"UYARI: Hasta ID uyuşmazlığı! t0={_baselinePatientId}, t1={_followupPatientId}");
+            }
+        }
+
+        // ====================================================================
+        //  ANALİZ BUTONU AKTİFLİĞİ
+        // ====================================================================
+        private void UpdateAnalyzeButtonState()
+        {
+            BtnAnalyze.IsEnabled = _mode == "single"
+                ? !string.IsNullOrEmpty(_singleDicomDir)
+                : !string.IsNullOrEmpty(_baselineDicomDir) && !string.IsNullOrEmpty(_followupDicomDir);
+        }
+
+        // ====================================================================
+        //  ANA ANALİZ BUTONU
+        // ====================================================================
+        private async void BtnAnalyze_Click(object sender, RoutedEventArgs e)
+        {
+            BtnAnalyze.IsEnabled = false;
+            BorderProgress.Visibility = Visibility.Visible;
+            ResetResultPanel();
+
+            try
+            {
+                if (_mode == "single")
+                    await RunSinglePipelineAsync();
+                else
+                    await RunLongitudinalPipelineAsync();
             }
             finally
             {
-                BtnPreprocess.IsEnabled = true;
+                BtnAnalyze.IsEnabled = true;
+                BorderProgress.Visibility = Visibility.Collapsed;
+                SetFooterStatus("Analiz tamamlandı.");
             }
         }
 
-        private async void BtnPredict_Click(object sender, RoutedEventArgs e)
+        // ====================================================================
+        //  TEK TEKTİK PİPELINE  →  POST /pipeline-single
+        // ====================================================================
+        private async Task RunSinglePipelineAsync()
         {
-            if (string.IsNullOrEmpty(_lastProcessedNifti) || !File.Exists(_lastProcessedNifti))
-            {
-                MessageBox.Show("Lütfen önce 'DICOM Ön İşleme' adımını çalıştırın.", "Uyarı", MessageBoxButton.OK, MessageBoxImage.Warning);
-                return;
-            }
+            Log("─── Tek Tetkik Pipeline Başlatıldı ───");
+            SetFooterStatus("Analiz çalışıyor...");
 
-            Log("AI Segmentasyon tahmini (Mock) başlatılıyor...");
-            BtnPredict.IsEnabled = false;
+            SetProgress(5, "Adım 1/3: DICOM ön işleme başlıyor...");
+
+            // DICOM metadata'dan hasta bilgilerini al
+            var meta = ReadDicomMetadata(_singleDicomDir);
+
+            string outputDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                "RECIST_Output", $"{meta.Id}_{DateTime.Now:yyyyMMdd_HHmmss}");
+
+            var payload = new
+            {
+                dicom_dir    = _singleDicomDir,
+                output_dir   = outputDir,
+                patient_id   = meta.Id,
+                patient_name = meta.Name,
+                study_date   = meta.Date
+            };
+
+            SetProgress(20, "Adım 2/3: AI Segmentasyon çalışıyor...");
 
             try
             {
-                string maskPath = _lastProcessedNifti.Replace(".nii.gz", "_mask.nii.gz");
-
-                var requestBody = new
-                {
-                    nifti_path = _lastProcessedNifti,
-                    output_mask_path = maskPath
-                };
-
-                string jsonContent = JsonConvert.SerializeObject(requestBody);
-                var content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
-
-                var response = await _httpClient.PostAsync($"{ApiBaseUrl}/predict-mock", content);
+                string json = JsonConvert.SerializeObject(payload);
+                var content = new StringContent(json, Encoding.UTF8, "application/json");
+                var response = await _httpClient.PostAsync($"{ApiBaseUrl}/pipeline-single", content);
                 string responseStr = await response.Content.ReadAsStringAsync();
 
-                if (response.IsSuccessStatusCode)
+                if (!response.IsSuccessStatusCode)
                 {
-                    var result = Newtonsoft.Json.Linq.JObject.Parse(responseStr);
-                    string maskResPath = result["mask_path"]?.ToString() ?? "";
-                    string count = result["detected_lesions_count"]?.ToString() ?? "0";
-                    string previewImgPath = result["preview_image_path"]?.ToString() ?? "";
-
-                    Log($"[BAŞARILI] AI Maskesi Oluşturuldu: {maskResPath}");
-
-                    if (!string.IsNullOrEmpty(previewImgPath) && File.Exists(previewImgPath))
-                    {
-                        LoadImageToViewer(previewImgPath);
-                    }
-
-                    TxtReportOutput.Text += $"\n\n=== AI SEGMENTASYON TAHMİNİ (MOCK) ===\n\n" +
-                                           $"Segmentasyon Maskesi: {maskResPath}\n" +
-                                           $"Tespit Edilen Hedef Lezyon Sayısı: {count}\n" +
-                                           $"Lezyon Hacmi & Feret Çapı Hesaplandı.";
+                    Log($"HATA: Pipeline isteği başarısız. ({responseStr})");
+                    SetProgress(0, "Hata oluştu.");
+                    return;
                 }
-                else
-                {
-                    Log($"HATA: Segmentasyon tahmini başarısız. ({responseStr})");
-                }
+
+                SetProgress(90, "Adım 3/3: Rapor oluşturuluyor...");
+
+                var result = JObject.Parse(responseStr);
+                DisplaySingleResults(result, meta);
+                SetProgress(100, "Tamamlandı!");
+                Log("─── Tek Tetkik Pipeline Tamamlandı ───");
             }
             catch (Exception ex)
             {
                 Log($"HATA: {ex.Message}");
-            }
-            finally
-            {
-                BtnPredict.IsEnabled = true;
+                SetProgress(0, "Hata oluştu.");
             }
         }
 
+        // ====================================================================
+        //  LONGİTUDİNAL PİPELINE  →  POST /pipeline
+        // ====================================================================
+        private async Task RunLongitudinalPipelineAsync()
+        {
+            Log("─── Longitudinal Pipeline Başlatıldı ───");
+            SetFooterStatus("Longitudinal analiz çalışıyor...");
+
+            SetProgress(5, "Adım 1/6: t₀ + t₁ DICOM ön işleme...");
+
+            var metaBaseline = ReadDicomMetadata(_baselineDicomDir);
+            var metaFollowup = ReadDicomMetadata(_followupDicomDir);
+
+            string outputDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                "RECIST_Output", $"{metaBaseline.Id}_longitudinal_{DateTime.Now:yyyyMMdd_HHmmss}");
+
+            var payload = new
+            {
+                baseline_dicom_dir = _baselineDicomDir,
+                followup_dicom_dir = _followupDicomDir,
+                output_dir         = outputDir,
+                patient_id         = metaBaseline.Id,
+                patient_name       = metaBaseline.Name,
+                study_date         = metaBaseline.Date,
+                use_llm            = false
+            };
+
+            SetProgress(15, "Adım 2/6: t₀ AI Segmentasyon...");
+
+            try
+            {
+                string json = JsonConvert.SerializeObject(payload);
+                var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+                // Uzun sürebileceği için progress güncelle
+                var progressTask = SimulateProgressAsync(15, 75, 6);
+                var apiTask = _httpClient.PostAsync($"{ApiBaseUrl}/pipeline", content);
+
+                await Task.WhenAll(progressTask, apiTask);
+
+                var response  = apiTask.Result;
+                string responseStr = await response.Content.ReadAsStringAsync();
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    Log($"HATA: Longitudinal pipeline isteği başarısız. ({responseStr})");
+                    SetProgress(0, "Hata oluştu.");
+                    return;
+                }
+
+                SetProgress(90, "Adım 6/6: Rapor oluşturuluyor...");
+                var result = JObject.Parse(responseStr);
+                DisplayLongitudinalResults(result, metaBaseline);
+                SetProgress(100, "Tamamlandı!");
+                Log("─── Longitudinal Pipeline Tamamlandı ───");
+            }
+            catch (Exception ex)
+            {
+                Log($"HATA: {ex.Message}");
+                SetProgress(0, "Hata oluştu.");
+            }
+        }
+
+        /// <summary>Progress bar'ı başlangıç değerinden bitiş değerine yavaşça ilerleten sahte animasyon görevidir.</summary>
+        private async Task SimulateProgressAsync(int from, int to, int steps)
+        {
+            int step = (to - from) / steps;
+            for (int i = from; i < to; i += step)
+            {
+                await Task.Delay(2000);
+                int current = Math.Min(i + step, to);
+                Dispatcher.Invoke(() => SetProgress(current, $"Analiz devam ediyor... (%{current})"));
+            }
+        }
+
+        // ====================================================================
+        //  SONUÇ GÖSTERİM: TEK TEKTİK
+        // ====================================================================
+        private void DisplaySingleResults(JObject result, DicomMeta meta)
+        {
+            try
+            {
+                // Lezyon metrikleri
+                var singleResult = result["single_timepoint_result"] ?? result;
+                int lesionCount  = singleResult["lesion_count"]?.ToObject<int>() ??
+                                   singleResult["radiomics"]?["total_lesions"]?.ToObject<int>() ?? 0;
+                double totalVol  = singleResult["total_volume_mm3"]?.ToObject<double>() ??
+                                   singleResult["radiomics"]?["total_volume_mm3"]?.ToObject<double>() ?? 0;
+                double sod       = singleResult["sod_mm"]?.ToObject<double>() ??
+                                   singleResult["radiomics"]?["sod_mm"]?.ToObject<double>() ?? 0;
+
+                // Karar kartı (tek tetkikte RECIST yok, "Baseline Tespit" göster)
+                TxtDecisionBadge.Text    = "BL";
+                TxtDecisionTitle.Text    = $"Baseline Tetkik — {meta.Name}";
+                TxtDecisionExplanation.Text = $"Hasta ID: {meta.Id} · Çekim: {meta.Date}";
+                BadgeDecision.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1D4ED8"));
+
+                TxtBaselineSummary.Text  = $"SOD: {sod:F1} mm";
+                TxtFollowupSummary.Text  = "";
+                TxtChangeSummary.Text    = "";
+                TxtLesionCount.Text      = lesionCount.ToString();
+                TxtVolumeSummary.Text    = $"{totalVol:F0} mm³";
+
+                // Rapor
+                string report = result["report"]?["report_text"]?.ToString() ??
+                                result["clinical_report"]?.ToString() ??
+                                BuildFallbackSingleReport(meta, lesionCount, sod, totalVol);
+                TxtReportOutput.Text = report;
+                Log($"[SONUÇ] Baseline — {lesionCount} lezyon, SOD: {sod:F1} mm");
+
+                // Preview görsel
+                string previewPath = singleResult["preview_image_path"]?.ToString() ??
+                                     result["segmentation"]?["preview_image_path"]?.ToString() ?? "";
+                if (!string.IsNullOrEmpty(previewPath) && File.Exists(previewPath))
+                    LoadImageToViewer(previewPath);
+            }
+            catch (Exception ex)
+            {
+                Log($"Sonuç gösterme hatası: {ex.Message}");
+            }
+        }
+
+        // ====================================================================
+        //  SONUÇ GÖSTERİM: LONGİTUDİNAL
+        // ====================================================================
+        private void DisplayLongitudinalResults(JObject result, DicomMeta meta)
+        {
+            try
+            {
+                // RECIST kararı
+                var recist = result["recist_decision"] ?? result;
+                string decision    = recist["decision"]?.ToString()          ?? "SD";
+                string explanation = recist["explanation"]?.ToString()       ?? "";
+                double sodBl       = recist["baseline_sod"]?.ToObject<double>() ??
+                                     result["matching"]?["sod_baseline"]?.ToObject<double>() ?? 0;
+                double sodFu       = recist["followup_sod"]?.ToObject<double>() ??
+                                     result["matching"]?["sod_followup"]?.ToObject<double>() ?? 0;
+                double changePct   = recist["change_percentage"]?.ToObject<double>() ??
+                                     result["matching"]?["change_percentage"]?.ToObject<double>() ?? 0;
+                bool   newLesion   = recist["new_lesion"]?.ToObject<bool>() ?? false;
+
+                int lesionCount    = result["matching"]?["matched_lesions"]?.ToObject<int>() ??
+                                     result["segmentation_baseline"]?["detected_lesions_count"]?.ToObject<int>() ?? 0;
+
+                // Karar rozeti rengi ve başlık
+                TxtDecisionBadge.Text    = decision;
+                TxtDecisionExplanation.Text = explanation;
+                TxtBaselineSummary.Text  = $"t₀ SOD: {sodBl:F1} mm";
+                TxtFollowupSummary.Text  = $"t₁ SOD: {sodFu:F1} mm";
+
+                string changeSign = changePct >= 0 ? "+" : "";
+                TxtChangeSummary.Text = $"Δ {changeSign}{changePct:F1}%";
+                TxtLesionCount.Text   = lesionCount.ToString();
+
+                switch (decision)
+                {
+                    case "CR":
+                        BadgeDecision.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#065F46"));
+                        TxtDecisionTitle.Text    = "Complete Response (Tam Yanıt) ✅";
+                        TxtChangeSummary.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#34D399"));
+                        break;
+                    case "PR":
+                        BadgeDecision.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1D4ED8"));
+                        TxtDecisionTitle.Text    = "Partial Response (Kısmi Yanıt)";
+                        TxtChangeSummary.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#60A5FA"));
+                        break;
+                    case "SD":
+                        BadgeDecision.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#78350F"));
+                        TxtDecisionTitle.Text    = "Stable Disease (Stabil)";
+                        TxtChangeSummary.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#FCD34D"));
+                        break;
+                    case "PD":
+                        BadgeDecision.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#7F1D1D"));
+                        TxtDecisionTitle.Text    = "Progressive Disease (İlerleme) ⚠️";
+                        TxtChangeSummary.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#F87171"));
+                        break;
+                }
+
+                // Rapor
+                string report = result["report"]?["report_text"]?.ToString() ??
+                                result["clinical_report"]?.ToString() ??
+                                BuildFallbackLongitudinalReport(meta, decision, explanation, sodBl, sodFu, changePct, newLesion);
+                TxtReportOutput.Text = report;
+                Log($"[KARAR] {decision} — SOD: {sodBl:F1}→{sodFu:F1} mm, Δ{changeSign}{changePct:F1}%");
+
+                // Preview görsel
+                string previewPath = result["segmentation_followup"]?["preview_image_path"]?.ToString() ??
+                                     result["segmentation_baseline"]?["preview_image_path"]?.ToString() ?? "";
+                if (!string.IsNullOrEmpty(previewPath) && File.Exists(previewPath))
+                    LoadImageToViewer(previewPath);
+            }
+            catch (Exception ex)
+            {
+                Log($"Sonuç gösterme hatası: {ex.Message}");
+            }
+        }
+
+        // ====================================================================
+        //  YARDIMCI: GÖRSEL YÜKLEYİCİ
+        // ====================================================================
         private void LoadImageToViewer(string imagePath)
         {
             try
@@ -258,13 +537,12 @@ namespace YazOkuluDetectUI
                 var bitmap = new System.Windows.Media.Imaging.BitmapImage();
                 bitmap.BeginInit();
                 bitmap.CacheOption = System.Windows.Media.Imaging.BitmapCacheOption.OnLoad;
-                bitmap.UriSource = new Uri(imagePath, UriKind.Absolute);
+                bitmap.UriSource   = new Uri(imagePath, UriKind.Absolute);
                 bitmap.EndInit();
                 bitmap.Freeze();
-
                 ImgSliceViewer.Source = bitmap;
                 TxtImagePlaceholder.Visibility = Visibility.Collapsed;
-                Log($"[GÖRSEL] 2D BT Kesiti ve AI Lezyon Etiketleri Yüklendi.");
+                Log($"[GÖRSEL] BT Kesiti yüklendi: {Path.GetFileName(imagePath)}");
             }
             catch (Exception ex)
             {
@@ -272,90 +550,145 @@ namespace YazOkuluDetectUI
             }
         }
 
-        private async void BtnRunRecist_Click(object sender, RoutedEventArgs e)
+        // ====================================================================
+        //  YARDIMCI: İLERLEME ÇUBUĞU
+        // ====================================================================
+        private void SetProgress(int value, string stepText)
         {
-            if (!double.TryParse(TxtBaselineSod.Text, out double baselineSod) ||
-                !double.TryParse(TxtFollowupSod.Text, out double followupSod))
+            Dispatcher.Invoke(() =>
             {
-                MessageBox.Show("Lütfen geçerli sayısal SOD değerleri girin.", "Hata", MessageBoxButton.OK, MessageBoxImage.Error);
-                return;
-            }
+                PbProgress.Value     = value;
+                TxtProgressStep.Text = stepText;
+                TxtProgressPct.Text  = $"{value}%";
+                SetFooterStatus(stepText);
+            });
+        }
 
-            bool newLesion = ChkNewLesion.IsChecked ?? false;
+        private void SetFooterStatus(string status)
+        {
+            Dispatcher.Invoke(() => TxtFooterStatus.Text = $"Durum: {status}");
+        }
 
-            Log("RECIST 1.1 Karar Motoru çalıştırılıyor...");
+        // ====================================================================
+        //  YARDIMCI: SONUÇ PANELİNİ SIFIRLA
+        // ====================================================================
+        private void ResetResultPanel()
+        {
+            TxtDecisionBadge.Text    = "...";
+            TxtDecisionTitle.Text    = "Analiz çalışıyor...";
+            TxtDecisionExplanation.Text = "Lütfen bekleyin.";
+            BadgeDecision.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1E3A5F"));
+            TxtBaselineSummary.Text  = "";
+            TxtFollowupSummary.Text  = "";
+            TxtChangeSummary.Text    = "";
+            TxtLesionCount.Text      = "...";
+            TxtVolumeSummary.Text    = "";
+            TxtReportOutput.Text     = "Analiz devam ediyor. Lütfen bekleyin...";
+            ImgSliceViewer.Source    = null;
+            TxtImagePlaceholder.Visibility = Visibility.Visible;
+        }
 
+        // ====================================================================
+        //  YARDIMCI: DICOM METADATA OKUMA
+        // ====================================================================
+        private DicomMeta ReadDicomMetadata(string dirPath)
+        {
+            var result = new DicomMeta { Id = "Bilinmiyor", Name = "Bilinmiyor", Date = "—" };
             try
             {
-                var requestBody = new
+                var files = Directory.GetFiles(dirPath, "*.*", SearchOption.AllDirectories)
+                    .Where(f => !f.EndsWith(".xml", StringComparison.OrdinalIgnoreCase)
+                             && !f.EndsWith(".txt", StringComparison.OrdinalIgnoreCase)
+                             && !f.EndsWith(".json", StringComparison.OrdinalIgnoreCase)
+                             && !Path.GetFileName(f).Equals("DICOMDIR", StringComparison.OrdinalIgnoreCase));
+
+                foreach (var file in files)
                 {
-                    sod_baseline = baselineSod,
-                    sod_followup = followupSod,
-                    new_lesion = newLesion
-                };
-
-                string jsonContent = JsonConvert.SerializeObject(requestBody);
-                var content = new StringContent(jsonContent, Encoding.UTF8, "application/json");
-
-                var response = await _httpClient.PostAsync($"{ApiBaseUrl}/recist-decision", content);
-                string responseStr = await response.Content.ReadAsStringAsync();
-
-                if (response.IsSuccessStatusCode)
-                {
-                    var result = Newtonsoft.Json.Linq.JObject.Parse(responseStr);
-
-                    string decision = result["decision"]?.ToString() ?? "SD";
-                    string explanation = result["explanation"]?.ToString() ?? "";
-                    double pct = result["change_percentage"]?.ToObject<double>() ?? 0.0;
-
-                    // UI Güncelle
-                    TxtDecisionBadge.Text = decision;
-                    TxtDecisionExplanation.Text = explanation;
-                    TxtBaselineSummary.Text = $"Baz SOD: {baselineSod:F1} mm";
-                    TxtFollowupSummary.Text = $"Kontrol SOD: {followupSod:F1} mm";
-                    TxtChangeSummary.Text = $"Değişim: {(pct >= 0 ? "+" : "")}{pct:F1}%";
-
-                    // Rozet Rengini Ayarla
-                    switch (decision)
+                    try
                     {
-                        case "CR":
-                            BadgeDecision.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#10B981")); // Yeşil
-                            TxtDecisionTitle.Text = "Complete Response (Tam Yanıt)";
-                            break;
-                        case "PR":
-                            BadgeDecision.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#0284C7")); // Mavi
-                            TxtDecisionTitle.Text = "Partial Response (Kısmi Yanıt)";
-                            break;
-                        case "SD":
-                            BadgeDecision.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#EAB308")); // Sarı
-                            TxtDecisionTitle.Text = "Stable Disease (Stabil Hastalık)";
-                            break;
-                        case "PD":
-                            BadgeDecision.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#EF4444")); // Kırmızı
-                            TxtDecisionTitle.Text = "Progressive Disease (İlerleyen Hastalık)";
-                            break;
+                        var ds = DicomFile.Open(file).Dataset;
+                        result.Id   = ds.GetSingleValueOrDefault(DicomTag.PatientID,   "Bilinmiyor");
+                        result.Name = ds.GetSingleValueOrDefault(DicomTag.PatientName, "Bilinmiyor");
+                        result.Date = ds.GetSingleValueOrDefault(DicomTag.StudyDate,   "—");
+                        // Tarihi okunabilir formata çevir: 20240115 → 15.01.2024
+                        if (result.Date.Length == 8 && long.TryParse(result.Date, out _))
+                            result.Date = $"{result.Date[6..8]}.{result.Date[4..6]}.{result.Date[0..4]}";
+                        break;
                     }
-
-                    Log($"[KARAR] RECIST 1.1 Sonucu: {decision} (%{pct:F1})");
-
-                    // Rapor Paneline Yaz
-                    TxtReportOutput.Text = $"====================================================\n" +
-                                           $"     ONKOLOJİK BT RECIST 1.1 KARAR DESTEK RAPORU    \n" +
-                                           $"====================================================\n\n" +
-                                           $"KLİNİK DEĞERLENDİRME: {decision}\n" +
-                                           $"AÇIKLAMA: {explanation}\n\n" +
-                                           $"ÖLÇÜM DETAYLARI:\n" +
-                                           $" - Baz (t0) Toplam Tümör Çapı (SOD): {baselineSod:F1} mm\n" +
-                                           $" - Kontrol (t1) Toplam Tümör Çapı (SOD): {followupSod:F1} mm\n" +
-                                           $" - Tümör Yükü Değişimi: %{pct:F1}\n" +
-                                           $" - Yeni Lezyon Varlığı: {(newLesion ? "EVET" : "HAYIR")}\n\n" +
-                                           $"SİSTEM NOTU: Bu karar tamamen RECIST 1.1 deterministik kural motoru tarafından üretilmiştir.";
+                    catch { /* DICOM olmayan dosyalar atla */ }
                 }
             }
-            catch (Exception ex)
-            {
-                Log($"HATA: {ex.Message}");
-            }
+            catch (Exception ex) { Log($"DICOM okuma uyarısı: {ex.Message}"); }
+            return result;
+        }
+
+        // ====================================================================
+        //  YARDIMCI: YEDEKLEMİ RAPOR ŞABLONLARİ (Backend rapor dönmezse)
+        // ====================================================================
+        private string BuildFallbackSingleReport(DicomMeta meta, int count, double sod, double vol)
+        {
+            return $"""
+                ============================================================
+                     ONKOLOJİK BT ANALİZ RAPORU — BASELINE TEKTİK
+                ============================================================
+
+                HASTA BİLGİLERİ:
+                 - Hasta ID   : {meta.Id}
+                 - Hasta Adı  : {meta.Name}
+                 - Çekim Tarihi: {meta.Date}
+
+                LEZYON TESPİT ÖZETI:
+                 - Tespit Edilen Lezyon Sayısı  : {count}
+                 - Toplam Tümör Çap Toplamı (SOD): {sod:F1} mm
+                 - Toplam Lezyon Hacmi           : {vol:F0} mm³
+
+                KLİNİK DEĞERLENDIRME:
+                 Bu tetkik ilk / referans (Baseline) çekim olarak kaydedilmiştir.
+                 Longitudinal karşılaştırma için Follow-up tetkiki beklenmektedir.
+
+                SİSTEM NOTU:
+                 Bu değerlendirme RECIST 1.1 deterministik kural motoru tarafından
+                 üretilmiştir. LLM hiçbir klinik karar vermemiştir.
+                """;
+        }
+
+        private string BuildFallbackLongitudinalReport(DicomMeta meta, string decision,
+            string explanation, double sodBl, double sodFu, double pct, bool newLesion)
+        {
+            string sign = pct >= 0 ? "+" : "";
+            return $"""
+                ============================================================
+                   ONKOLOJİK BT RECIST 1.1 LONGİTUDİNAL ANALİZ RAPORU
+                ============================================================
+
+                HASTA BİLGİLERİ:
+                 - Hasta ID  : {meta.Id}
+                 - Hasta Adı : {meta.Name}
+                 - Referans Tarihi: {meta.Date}
+
+                KLİNİK DEĞERLENDİRME: {decision}
+                AÇIKLAMA: {explanation}
+
+                ÖLÇÜM DETAYLARI:
+                 - Baseline (t₀) Toplam Tümör Çapı (SOD): {sodBl:F1} mm
+                 - Follow-up (t₁) Toplam Tümör Çapı (SOD): {sodFu:F1} mm
+                 - Tümör Yükü Değişimi                   : {sign}{pct:F1}%
+                 - Yeni Lezyon Varlığı                   : {(newLesion ? "EVET ⚠️" : "HAYIR")}
+
+                SİSTEM NOTU:
+                 Bu karar tamamen RECIST 1.1 deterministik kural motoru tarafından
+                 üretilmiştir. LLM hiçbir klinik karar vermemiştir.
+                """;
+        }
+
+        // ====================================================================
+        //  İÇ SINIF: DICOM META VERISI
+        // ====================================================================
+        private class DicomMeta
+        {
+            public string Id   { get; set; } = "Bilinmiyor";
+            public string Name { get; set; } = "Bilinmiyor";
+            public string Date { get; set; } = "—";
         }
     }
 }

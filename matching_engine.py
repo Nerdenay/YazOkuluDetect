@@ -74,34 +74,36 @@ def register_baseline_to_followup(baseline_nifti: str, followup_nifti: str,
     moving_resampled = sitk.Resample(moving_image, fixed_image, rigid_transform,
                                       sitk.sitkLinear, 0.0, moving_image.GetPixelID())
     
-    # B-Spline mesh boyutları (grid spacing ~50mm -> orta düzey esneklik)
-    grid_physical_spacing = [50.0, 50.0, 50.0]
+    # B-Spline mesh boyutları (grid spacing ~80mm -> daha az kontrol noktası = hızlı CPU)
+    # NOT: 50mm->80mm geçişi test/CPU ortamında registration süresini ~3-4x kısaltır.
+    # GPU ortamında veya klinik doğruluk kritikse 50mm'e düşürülebilir.
+    grid_physical_spacing = [80.0, 80.0, 80.0]
     image_physical_size = [
         fixed_image.GetSize()[i] * fixed_image.GetSpacing()[i]
         for i in range(3)
     ]
     mesh_size = [
-        int(round(image_physical_size[i] / grid_physical_spacing[i]))
+        max(2, int(round(image_physical_size[i] / grid_physical_spacing[i])))
         for i in range(3)
     ]
     
     bspline_transform = sitk.BSplineTransformInitializer(fixed_image, mesh_size, order=3)
     
     bspline_registration = sitk.ImageRegistrationMethod()
-    bspline_registration.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
+    bspline_registration.SetMetricAsMattesMutualInformation(numberOfHistogramBins=32)
     bspline_registration.SetMetricSamplingStrategy(bspline_registration.RANDOM)
-    bspline_registration.SetMetricSamplingPercentage(0.01)
+    bspline_registration.SetMetricSamplingPercentage(0.05)
     bspline_registration.SetInterpolator(sitk.sitkLinear)
     bspline_registration.SetOptimizerAsLBFGSB(
-        gradientConvergenceTolerance=1e-5,
-        numberOfIterations=100,
+        gradientConvergenceTolerance=1e-4,
+        numberOfIterations=50,
         maximumNumberOfCorrections=5,
-        maximumNumberOfFunctionEvaluations=1000,
+        maximumNumberOfFunctionEvaluations=300,
         costFunctionConvergenceFactor=1e+7
     )
     bspline_registration.SetInitialTransform(bspline_transform, inPlace=False)
-    bspline_registration.SetShrinkFactorsPerLevel(shrinkFactors=[2, 1])
-    bspline_registration.SetSmoothingSigmasPerLevel(smoothingSigmas=[1, 0])
+    bspline_registration.SetShrinkFactorsPerLevel(shrinkFactors=[2])
+    bspline_registration.SetSmoothingSigmasPerLevel(smoothingSigmas=[1])
     bspline_registration.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
     
     final_bspline_transform = bspline_registration.Execute(fixed_image, moving_resampled)

@@ -306,3 +306,61 @@ Raporu Türkçe ve İngilizce olarak yaz.
 
 > [!TIP]
 > **Ablation study** (hibrit matching vs. naive centroid-only vs. IoU-only karşılaştırması) yayın özgünlüğünü güçlü şekilde kanıtlar ve tek başına makaleye değer bir bulgu üretir.
+
+---
+
+## ✅ Eğitim Sonrası Yapılacaklar Listesi
+
+> [!IMPORTANT]
+> Model eğitimi tamamlanıp `./models/checkpoint_final.pth` dosyası yerleştirildikten sonra aşağıdaki adımlar **sırayla** uygulanmalıdır.
+
+### 1. Model Ağırlığını Yerleştir
+```
+c:\Projects\YazOkuluDetect\models\checkpoint_final.pth
+```
+Başka hiçbir kod değişikliği gerekmez — sistem otomatik olarak gerçek AI moduna geçer.
+Arayüzdeki rozet: **"🔧 Test Modu"** → **"🧠 Gerçek AI Modu (nnU-Net)"** olarak güncellenir.
+
+---
+
+### 2. B-Spline Registration Parametrelerini Klinik Moda Al
+
+> [!WARNING]
+> **Bu adım kritiktir.** Şu an B-Spline registration parametreleri test/geliştirme ortamı için hızlandırılmış değerlere ayarlıdır.
+> Klinik kullanım öncesinde [`matching_engine.py`](file:///c:/Projects/YazOkuluDetect/matching_engine.py) dosyasında şu değişikliği yapın:
+
+**Dosya:** [`matching_engine.py`](file:///c:/Projects/YazOkuluDetect/matching_engine.py) — yaklaşık satır 77-104
+
+```python
+# ❌ MEVCUT (Test/Hızlı mod — eğitim sonrası bunu DEĞİŞTİRİN):
+grid_physical_spacing = [80.0, 80.0, 80.0]   # kaba grid
+numberOfIterations    = 50                     # az iterasyon
+maximumNumberOfFunctionEvaluations = 300       # az değerlendirme
+shrinkFactors = [2]                            # tek piramit seviyesi
+
+# ✅ KLİNİK MOD (eğitim sonrası buna GEÇİN):
+grid_physical_spacing = [50.0, 50.0, 50.0]   # hassas grid
+numberOfIterations    = 100                    # yeterli iterasyon
+maximumNumberOfFunctionEvaluations = 1000      # tam değerlendirme
+shrinkFactors = [2, 1]                         # iki piramit seviyesi
+```
+
+**Neden önemli:** 50mm grid spacing, organ kayması düzeltmede ~2-3mm daha hassas registration sağlar. Hatalı registration → yanlış lezyon eşleştirme → yanlış SOD → yanlış RECIST kararı zincirini önler.
+
+---
+
+### 3. Sistem Doğrulama Testleri
+- [ ] En az 5 hasta çiftiyle (t0 + t1) end-to-end pipeline testi
+- [ ] RECIST kararlarını radyolog referans kararlarıyla karşılaştır
+- [ ] Registration kalitesini görsel olarak doğrula (hizalanmış görüntüleri kontrol et)
+- [ ] Lezyon eşleştirme oranını hesapla (yanlış eşleşme var mı?)
+
+---
+
+### 4. Opsiyonel: LLM Rapor Modunu Aktif Et
+`main.py` — `/pipeline` endpoint çağrısında:
+```json
+{ "use_llm": true, "llm_api_key": "YOUR_GEMINI_API_KEY" }
+```
+LLM **karar vermez** — sadece doğrulanmış RECIST metriklerini klinik rapor diline çevirir.
+
