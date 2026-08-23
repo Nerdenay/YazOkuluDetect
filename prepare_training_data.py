@@ -55,44 +55,57 @@ except ImportError as e:
 
 def find_dicom_series(root_dir: str) -> list:
     """
-    Verilen ana klasörün altındaki tüm hasta çekim klasörlerini (T0, T1, DICOM) bulur.
-    Çift kayıtları ve gereksiz alt klasör tekrarlarını temizler.
+    Sectra / RadiAnt PACS CD yapısını doğrudan hedefler:
+      {HASTA_ADI}/{T0 veya T1}/DICOM/{SERI_NO}/...
+    
+    DLL, EXE, BAT ve viewer dosyalarını tamamen atlar, sadece gerçek kesit serilerini seçer.
     """
-    series_dirs = set()
     root = Path(root_dir)
+    selected_series = []
 
-    # 1. DICOMDIR içeren ana klasörler
-    for path in sorted(root.rglob("DICOMDIR")):
-        series_dirs.add(str(path.parent))
+    print("[INFO] Hasta ve zaman serileri taranıyor...")
+    
+    # 1. Seviye: Hasta klasörleri (Örn: "AYSEL BALKAN")
+    patients = [p for p in sorted(root.iterdir()) if p.is_dir() and not p.name.startswith(('.', '_'))]
+    
+    for patient_dir in patients:
+        # 2. Seviye: Zaman noktaları (Örn: "T0", "T1") veya doğrudan DICOM
+        subdirs = [d for d in sorted(patient_dir.iterdir()) if d.is_dir() and not d.name.startswith(('.', '_'))]
+        
+        # Eğer alt klasörlerde T0/T1 varsa
+        time_dirs = [d for d in subdirs if (d / "DICOM").exists()]
+        if not time_dirs:
+            # Belki doğrudan DICOM klasörü vardır
+            if (patient_dir / "DICOM").exists():
+                time_dirs = [patient_dir]
+            else:
+                time_dirs = subdirs
 
-    # 2. .dcm içeren klasörler (eğer üst klasörü zaten eklenmemişse)
-    for path in sorted(root.rglob("*.dcm")):
-        parent = path.parent
-        # Eğer parent'ın üst klasörlerinden biri zaten DICOMDIR ile eklendiyse atla
-        is_covered = any(str(parent).startswith(d) for d in series_dirs)
-        if not is_covered:
-            series_dirs.add(str(parent))
+        for t_dir in time_dirs:
+            dicom_root = t_dir / "DICOM" if (t_dir / "DICOM").exists() else t_dir
+            
+            # DICOM altındaki en çok kesite sahip seriyi bul (aksiyal ana hacim)
+            best_dir = None
+            max_slices = 0
+            
+            for dirpath, dirnames, filenames in os.walk(dicom_root):
+                valid_files = [
+                    f for f in filenames
+                    if not f.startswith(('.', '_'))
+                    and f.upper() not in ['DICOMDIR', 'REPORTS.TXT', 'DESCRIPT.ION']
+                    and not f.endswith(('.txt', '.xml', '.pdf', '.jpg', '.png', '.dll', '.exe', '.bat', '.ico'))
+                ]
+                if len(valid_files) > max_slices:
+                    max_slices = len(valid_files)
+                    best_dir = dirpath
+            
+            if best_dir and max_slices >= 3:
+                label = f"{patient_dir.name}/{t_dir.name}"
+                print(f"  • {label} -> {max_slices} kesit ({Path(best_dir).name})")
+                selected_series.append(best_dir)
 
-    # 3. Eğer hiçbiri bulunamadıysa doğrudan 1. ve 2. seviye alt klasörleri tara
-    if not series_dirs:
-        for p1 in root.iterdir():
-            if p1.is_dir():
-                subdirs = [p2 for p2 in p1.iterdir() if p2.is_dir()]
-                if subdirs:
-                    for p2 in subdirs:
-                        series_dirs.add(str(p2))
-                else:
-                    series_dirs.add(str(p1))
-
-    # Gereksiz iç içe alt klasörleri temizle (ana klasörü koru)
-    cleaned = sorted(list(series_dirs))
-    final_dirs = []
-    for d in cleaned:
-        # Eğer daha üst bir ana klasör listede varsa bu alt klasörü atla
-        if not any(d != other and d.startswith(other + os.sep) for other in cleaned):
-            final_dirs.append(d)
-
-    return sorted(final_dirs) if final_dirs else cleaned
+    print(f"\n[INFO] Toplam {len(selected_series)} adet geçerli BT serisi bulundu.\n")
+    return selected_series
 
 
 def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True) -> bool:
@@ -242,7 +255,8 @@ def process_all_patients(dicom_root: str, output_dir: str, fast_mode: bool = Tru
 
     for idx, dicom_dir in enumerate(series_list, 1):
         patient_id = f"hasta_{idx:03d}"
-        print(f"[{idx}/{len(series_list)}] {Path(dicom_dir).name} → {patient_id}")
+        rel_label = os.path.relpath(dicom_dir, dicom_root)
+        print(f"[{idx}/{len(series_list)}] {rel_label} → {patient_id}")
 
         # 1. DICOM → NIfTI ───────────────────────────────────────────────────
         nifti_out = str(nifti_dir / f"{patient_id}.nii.gz")
