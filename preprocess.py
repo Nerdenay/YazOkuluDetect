@@ -15,56 +15,62 @@ def convert_dicom_to_nifti(dicom_dir: str, output_dir: str, output_filename: str
     output_path = os.path.join(output_dir, output_filename)
     print(f"[INFO] DICOM serisi dönüştürülüyor: {dicom_dir} -> {output_path}")
 
-    # 1. Yöntem: dicom2nifti dene
+    # 1. Yöntem: dicom2nifti (en basit, bazen birden fazla dosya üretir)
     try:
         dicom2nifti.convert_directory(dicom_dir, output_dir, compression=True, reorient=True)
-        generated_files = [f for f in os.listdir(output_dir) if f.endswith('.nii.gz') and f != output_filename]
+        
+        # dicom2nifti birden fazla seri üretebilir → EN BÜYÜK dosyayı (ana CT) al
+        generated_files = [
+            f for f in os.listdir(output_dir)
+            if f.endswith('.nii.gz') and f != output_filename
+        ]
         if generated_files:
-            temp_path = os.path.join(output_dir, generated_files[0])
+            # Boyuta göre sırala — en büyük = ana aksiyal CT serisi
+            generated_files.sort(
+                key=lambda f: os.path.getsize(os.path.join(output_dir, f)),
+                reverse=True
+            )
+            # En büyüğünü hasta_XXX.nii.gz olarak yeniden adlandır
+            best_path = os.path.join(output_dir, generated_files[0])
             if os.path.exists(output_path):
                 os.remove(output_path)
-            os.rename(temp_path, output_path)
+            os.rename(best_path, output_path)
             
-        if os.path.exists(output_path):
+            # Geri kalan küçük serileri (koronal/sagital/akciğer rekonstrüksiyonları) temizle
+            for extra_file in generated_files[1:]:
+                extra_path = os.path.join(output_dir, extra_file)
+                if os.path.exists(extra_path):
+                    os.remove(extra_path)
+                    
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 1_000_000:  # > 1 MB
             print("[SUCCESS] DICOM -> NIfTI dönüşümü tamamlandı (dicom2nifti).")
             return output_path
+        elif os.path.exists(output_path):
+            os.remove(output_path)  # Çok küçük = yanlış seri, yeniden dene
+            
     except Exception as e:
-        print(f"[INFO] dicom2nifti deneniyor, SimpleITK fallback'e geçiliyor... ({e})")
+        print(f"[INFO] dicom2nifti başarısız, pydicom motoruna geçiliyor... ({type(e).__name__})")
+        # Kısmen oluşmuş dosyaları temizle
+        for f in os.listdir(output_dir):
+            if f.endswith('.nii.gz') and f != output_filename:
+                try:
+                    os.remove(os.path.join(output_dir, f))
+                except Exception:
+                    pass
 
-    # 2. Yöntem: SimpleITK ImageSeriesReader
-    try:
-        reader = sitk.ImageSeriesReader()
-        all_dicom_files = []
-        
-        for root, dirs, files in os.walk(dicom_dir):
-            if not files:
-                continue
-            series_ids = reader.GetGDCMSeriesIDs(root)
-            for sid in series_ids:
-                fnames = reader.GetGDCMSeriesFileNames(root, sid)
-                if len(fnames) > len(all_dicom_files):
-                    all_dicom_files = fnames
-
-        if all_dicom_files and len(all_dicom_files) >= 5:
-            reader.SetFileNames(all_dicom_files)
-            image = reader.Execute()
-            sitk.WriteImage(image, output_path)
-            print(f"[SUCCESS] DICOM -> NIfTI dönüşümü tamamlandı (SimpleITK: {len(all_dicom_files)} kesit).")
-            return output_path
-    except Exception as e:
-        print(f"[INFO] SimpleITK deneniyor, pydicom motoruna geçiliyor... ({e})")
-
-    # 3. Yöntem: pydicom + nibabel (Sectra PACS ve uzantısız dosyalar için %100 garantili)
+    # 2. Yöntem: pydicom + nibabel (Drive uyumlu, uzantısız dosyalar dahil)
     try:
         import pydicom
         import nibabel as nib
 
+        # Tüm DICOM dosyalarını tara ve seri bazında grupla
         series_dict = {}
         for root, dirs, files in os.walk(dicom_dir):
+            dirs[:] = [d for d in dirs if not d.startswith('.')]  # Gizli klasörü atla
             for f in files:
-                fpath = os.path.join(root, f)
-                if f.upper() in ["DICOMDIR", "REPORTS", ".DS_STORE"] or f.endswith((".txt", ".xml", ".pdf")):
+                if f.upper() in ["DICOMDIR", ".DS_STORE"] or f.endswith((".txt", ".xml", ".pdf", ".jpg")):
                     continue
+                fpath = os.path.join(root, f)
                 try:
                     ds = pydicom.dcmread(fpath, stop_before_pixels=True, force=True)
                     if hasattr(ds, "SeriesInstanceUID") and hasattr(ds, "ImagePositionPatient"):
@@ -82,7 +88,7 @@ def convert_dicom_to_nifti(dicom_dir: str, output_dir: str, output_filename: str
         best_sid = max(series_dict.keys(), key=lambda k: len(series_dict[k]))
         selected_files = series_dict[best_sid]
 
-        if len(selected_files) < 3:
+        if len(selected_files) < 5:
             raise RuntimeError(f"Yetersiz kesit sayısı ({len(selected_files)}): {dicom_dir}")
 
         # Kesitleri z-pozisyonuna göre sırala
@@ -94,38 +100,36 @@ def convert_dicom_to_nifti(dicom_dir: str, output_dir: str, output_filename: str
             except Exception:
                 pass
 
-        slices.sort(key=lambda s: float(s.ImagePositionPatient[2]) if hasattr(s, "ImagePositionPatient") else float(getattr(s, "InstanceNumber", 0)))
+        slices.sort(key=lambda s: float(s.ImagePositionPatient[2])
+                    if hasattr(s, "ImagePositionPatient") else float(getattr(s, "InstanceNumber", 0)))
 
-        # 3D Piksel matrisini ve HU değerlerini oluştur
+        # 3D hacim ve HU değerleri
         images = []
         for s in slices:
             arr = s.pixel_array.astype(np.float32)
             slope = float(getattr(s, "RescaleSlope", 1.0))
             intercept = float(getattr(s, "RescaleIntercept", 0.0))
-            hu = arr * slope + intercept
-            images.append(hu)
+            images.append(arr * slope + intercept)
 
-        volume = np.stack(images, axis=-1)  # (Y, X, Z)
+        volume = np.stack(images, axis=-1)
         volume = np.swapaxes(volume, 0, 1)  # (X, Y, Z)
 
-        # Spacing ve Oryantasyon
+        # Voxel spacing
         ps = slices[0].PixelSpacing if hasattr(slices[0], "PixelSpacing") else [1.0, 1.0]
         if len(slices) > 1 and hasattr(slices[0], "ImagePositionPatient") and hasattr(slices[1], "ImagePositionPatient"):
             dz = abs(float(slices[1].ImagePositionPatient[2]) - float(slices[0].ImagePositionPatient[2]))
-            if dz == 0:
-                dz = float(getattr(slices[0], "SliceThickness", 1.0))
+            dz = dz if dz > 0 else float(getattr(slices[0], "SliceThickness", 1.0))
         else:
             dz = float(getattr(slices[0], "SliceThickness", 1.0))
 
         affine = np.diag([float(ps[0]), float(ps[1]), float(dz), 1.0])
-        nii = nib.Nifti1Image(volume.astype(np.int16), affine)
-        nib.save(nii, output_path)
+        nib.save(nib.Nifti1Image(volume.astype(np.int16), affine), output_path)
 
-        print(f"[SUCCESS] DICOM -> NIfTI dönüşümü tamamlandı (pydicom: {len(slices)} kesit, boyut: {volume.shape}).")
+        print(f"[SUCCESS] DICOM -> NIfTI tamamlandı (pydicom: {len(slices)} kesit, boyut: {volume.shape}).")
         return output_path
 
     except Exception as e:
-        print(f"[ERROR] Tüm dönüştürücüler başarısız oldu: {str(e)}")
+        print(f"[ERROR] Tüm dönüştürücüler başarısız: {str(e)}")
         if os.path.exists(output_path):
             os.remove(output_path)
         raise
