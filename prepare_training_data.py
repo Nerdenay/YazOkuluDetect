@@ -278,8 +278,19 @@ def process_all_patients(dicom_root: str, output_dir: str, fast_mode: bool = Tru
         # 4. nnU-Net v2 formatına kopyala ────────────────────────────────────
         # imagesTr: hasta_001_0000.nii.gz (BT kanalı)
         # labelsTr: hasta_001.nii.gz      (maske)
-        shutil.copy2(nifti_out, str(Path(images_tr) / f"{patient_id}_0000.nii.gz"))
-        shutil.copy2(merged_label_path, str(Path(labels_tr) / f"{patient_id}.nii.gz"))
+        try:
+            shutil.copy2(nifti_out, str(Path(images_tr) / f"{patient_id}_0000.nii.gz"))
+            shutil.copy2(merged_label_path, str(Path(labels_tr) / f"{patient_id}.nii.gz"))
+        except Exception as copy_err:
+            print(f"    [4/4] ❌ nnU-Net kopyalama hatası: {copy_err}")
+            results.append({"id": patient_id, "status": "HATA", "adim": "Kopyalama"})
+            print()
+            continue
+
+        # Karaciğer voxel sayısı çok düşükse uyar (yanlış seri veya boş maske)
+        if stats["liver_voxels"] < 1000:
+            print(f"    [⚠️] Karaciğer voxel sayısı çok düşük ({stats['liver_voxels']}), "
+                  f"maske güvenilmeyebilir - devam ediliyor")
 
         results.append({
             "id": patient_id,
