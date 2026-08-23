@@ -135,62 +135,61 @@ def find_dicom_series(root_dir: str) -> list:
 
 def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True) -> bool:
     """
-    TotalSegmentator CLI entry point'ini subprocess olarak çalıştırır.
-    Linux (Colab), Windows (.venv) ve tüm ortamlarda shutil.which ile otomatik bulur.
+    TotalSegmentator'ı doğrudan Python API üzerinden (in-process) çalıştırır.
+    Subprocess kullanmadığı için klavye kesmesi (^C), semaphore sızıntısı veya 
+    erken kapanma hataları yaşanmaz.
     """
     Path(ts_output_dir).mkdir(parents=True, exist_ok=True)
 
-    # 1. TotalSegmentator CLI yolunu bul (Windows ve Linux/Colab uyumlu)
-    ts_bin = shutil.which("TotalSegmentator")
-    if not ts_bin:
-        scripts_dir = Path(sys.executable).parent
-        for candidate in ["TotalSegmentator", "TotalSegmentator.exe"]:
-            if (scripts_dir / candidate).exists():
-                ts_bin = str(scripts_dir / candidate)
-                break
-
-    def run_cmd(cmd, label):
-        if ts_bin:
-            full_cmd = [ts_bin] + cmd
+    print(f"    [TotalSegmentator] Karaciğer segmentasyonu başlatılıyor...")
+    
+    # 1. Doğrudan Python API ile çalıştır (en kararlı yöntem)
+    try:
+        from totalsegmentator.python_api import totalsegmentator
+        import nibabel as nib
+        
+        img = nib.load(nifti_path)
+        
+        # Karaciğer segmentasyonu
+        totalsegmentator(
+            input=img,
+            output=Path(ts_output_dir),
+            fast=fast,
+            roi_subset=["liver"],
+            quiet=True,
+            verbose=False
+        )
+        
+        liver_file = Path(ts_output_dir) / "liver.nii.gz"
+        if liver_file.exists():
+            print(f"    [TotalSegmentator] ✅ Karaciğer segmentasyonu tamamlandı.")
+            return True
         else:
-            full_cmd = [sys.executable, "-m", "totalsegmentator.bin.TotalSegmentator"] + cmd
-        result = subprocess.run(full_cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode != 0:
-            print(f"    [TotalSegmentator] ⚠️  {label} hatası: {result.stderr[-300:] if result.stderr else ''}")
-            return False
-        return True
-
-    # Adım 1: Karaciğer segmentasyonu (fast modda çalışır)
-    print(f"    [TotalSegmentator] Adım 1/2: Karaciğer segmentasyonu...")
-    liver_cmd = ["-i", nifti_path, "-o", ts_output_dir, "--roi_subset", "liver"]
-    if fast:
-        liver_cmd.append("--fast")
-    liver_ok = run_cmd(liver_cmd, "Karaciğer")
-
-    if not liver_ok:
-        # Python API fallback - sadece liver
-        try:
-            from totalsegmentator.python_api import totalsegmentator
-            import nibabel as nib
-            img = nib.load(nifti_path)
-            totalsegmentator(img, Path(ts_output_dir), fast=fast,
-                             roi_subset=["liver"], quiet=False)
-            liver_ok = True
-            print(f"    [TotalSegmentator] ✅ Karaciğer OK (Python API)")
-        except Exception as e:
-            print(f"    [TotalSegmentator] ❌ Python API hatası: {e}")
+            print(f"    [TotalSegmentator] ⚠️  liver.nii.gz üretilemedi.")
             return False
 
-    # Adım 2: Karaciğer tümörü (opsiyonel)
-    print(f"    [TotalSegmentator] Adım 2/2: Tümör tespiti (opsiyonel)...")
-    tumor_cmd = ["-i", nifti_path, "-o", ts_output_dir,
-                 "--roi_subset", "liver_tumor", "--task", "total"]
-    tumor_ok = run_cmd(tumor_cmd, "Tümör")
-    if not tumor_ok:
-        print(f"    [TotalSegmentator] ℹ️  Tümör modeli atlandı → karaciğer parankim maskesi kullanılacak")
+    except Exception as e:
+        print(f"    [TotalSegmentator] Python API hatası: {e}, CLI deneniyor...")
 
-    print(f"    [TotalSegmentator] ✅ Segmentasyon tamamlandı")
-    return liver_ok
+    # 2. Fallback: CLI
+    try:
+        ts_bin = shutil.which("TotalSegmentator") or "TotalSegmentator"
+        cmd = [ts_bin, "-i", nifti_path, "-o", ts_output_dir, "--roi_subset", "liver"]
+        if fast:
+            cmd.append("--fast")
+        
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=600)
+        liver_file = Path(ts_output_dir) / "liver.nii.gz"
+        if liver_file.exists():
+            print(f"    [TotalSegmentator] ✅ Karaciğer segmentasyonu tamamlandı (CLI).")
+            return True
+        else:
+            print(f"    [TotalSegmentator] ❌ Segmentasyon başarısız: {res.stderr[-200:] if res.stderr else 'Bilinmeyen hata'}")
+            return False
+            
+    except Exception as e:
+        print(f"    [TotalSegmentator] ❌ Genel hata: {e}")
+        return False
 
 
 
