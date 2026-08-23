@@ -7,26 +7,17 @@ import numpy as np
 def convert_dicom_to_nifti(dicom_dir: str, output_dir: str, output_filename: str) -> str:
     """
     Belirtilen DICOM klasöründeki kesitleri okur ve tek bir .nii.gz (NIfTI) dosyasına dönüştürür.
-    
-    Args:
-        dicom_dir (str): DICOM dosyalarının bulunduğu klasörün yolu.
-        output_dir (str): Çıktı NIfTI dosyasının kaydedileceği klasörün yolu.
-        output_filename (str): Çıktı dosyasının adı (örn: 'patient_baseline.nii.gz').
-        
-    Returns:
-        str: Oluşturulan NIfTI dosyasının tam yolu.
+    Sectra PACS ve farklı DICOM formatları için hem dicom2nifti hem de SimpleITK motorunu destekler.
     """
     if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
         
     output_path = os.path.join(output_dir, output_filename)
-    
     print(f"[INFO] DICOM serisi dönüştürülüyor: {dicom_dir} -> {output_path}")
-    
+
+    # 1. Yöntem: dicom2nifti dene
     try:
         dicom2nifti.convert_directory(dicom_dir, output_dir, compression=True, reorient=True)
-        
-        # dicom2nifti dosya adını seri UID'sine göre verir; biz istediğimiz isme yeniden adlandırıyoruz.
         generated_files = [f for f in os.listdir(output_dir) if f.endswith('.nii.gz') and f != output_filename]
         if generated_files:
             temp_path = os.path.join(output_dir, generated_files[0])
@@ -34,11 +25,56 @@ def convert_dicom_to_nifti(dicom_dir: str, output_dir: str, output_filename: str
                 os.remove(output_path)
             os.rename(temp_path, output_path)
             
-        print("[SUCCESS] DICOM -> NIfTI dönüşümü tamamlandı.")
-        return output_path
-        
+        if os.path.exists(output_path):
+            print("[SUCCESS] DICOM -> NIfTI dönüşümü tamamlandı (dicom2nifti).")
+            return output_path
     except Exception as e:
-        print(f"[ERROR] Dönüşüm sırasında hata oluştu: {str(e)}")
+        print(f"[INFO] dicom2nifti deneniyor, SimpleITK fallback'e geçiliyor... ({e})")
+
+    # 2. Yöntem: SimpleITK ImageSeriesReader (PACS ve uzantısız dosyalar için en sağlamı)
+    try:
+        reader = sitk.ImageSeriesReader()
+        
+        # Klasörün içindeki ve alt klasörlerdeki serileri tara
+        series_ids = reader.GetGDCMSeriesIDs(dicom_dir)
+        
+        # Eğer doğrudan bulunamadıysa alt klasörlere bak
+        target_dir = dicom_dir
+        if not series_ids:
+            for root, dirs, files in os.walk(dicom_dir):
+                ids = reader.GetGDCMSeriesIDs(root)
+                if ids:
+                    series_ids = ids
+                    target_dir = root
+                    break
+
+        if not series_ids:
+            raise RuntimeError(f"DICOM serisi bulunamadı: {dicom_dir}")
+
+        # En çok kesite sahip olan seriyi seç (aksiyal ana hacim)
+        best_series = None
+        max_files = 0
+        for sid in series_ids:
+            files = reader.GetGDCMSeriesFileNames(target_dir, sid)
+            if len(files) > max_files:
+                max_files = len(files)
+                best_series = sid
+
+        if not best_series or max_files == 0:
+            raise RuntimeError(f"Geçerli DICOM kesiti bulunamadı: {dicom_dir}")
+
+        dicom_files = reader.GetGDCMSeriesFileNames(target_dir, best_series)
+        reader.SetFileNames(dicom_files)
+        image = reader.Execute()
+
+        sitk.WriteImage(image, output_path)
+        print(f"[SUCCESS] DICOM -> NIfTI dönüşümü tamamlandı (SimpleITK: {max_files} kesit).")
+        return output_path
+
+    except Exception as e:
+        print(f"[ERROR] Dönüşüm başarısız oldu: {str(e)}")
+        if os.path.exists(output_path):
+            os.remove(output_path)
         raise
 
 def apply_windowing(nifti_path: str, output_path: str, window_level: int = 40, window_width: int = 150) -> str:

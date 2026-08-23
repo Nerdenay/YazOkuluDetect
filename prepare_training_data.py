@@ -83,22 +83,24 @@ def find_dicom_series(root_dir: str) -> list:
 def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True) -> bool:
     """
     TotalSegmentator CLI entry point'ini subprocess olarak çalıştırır.
-    Adım 1: Karaciğer segmentasyonu (fast modda çalışır, her zaman mevcut)
-    Adım 2: Karaciğer tümörü (opsiyonel, ayrı model indirir ~200MB)
+    Linux (Colab), Windows (.venv) ve tüm ortamlarda shutil.which ile otomatik bulur.
     """
     Path(ts_output_dir).mkdir(parents=True, exist_ok=True)
 
-    # CLI entry point yolu
-    scripts_dir = Path(sys.executable).parent
-    ts_exe = scripts_dir / "TotalSegmentator"
-    if not ts_exe.exists():
-        ts_exe = scripts_dir / "TotalSegmentator.exe"
+    # 1. TotalSegmentator CLI yolunu bul (Windows ve Linux/Colab uyumlu)
+    ts_bin = shutil.which("TotalSegmentator")
+    if not ts_bin:
+        scripts_dir = Path(sys.executable).parent
+        for candidate in ["TotalSegmentator", "TotalSegmentator.exe"]:
+            if (scripts_dir / candidate).exists():
+                ts_bin = str(scripts_dir / candidate)
+                break
 
     def run_cmd(cmd, label):
-        if ts_exe.exists():
-            full_cmd = [str(ts_exe)] + cmd
+        if ts_bin:
+            full_cmd = [ts_bin] + cmd
         else:
-            full_cmd = [sys.executable, str(scripts_dir / "TotalSegmentator")] + cmd
+            full_cmd = [sys.executable, "-m", "totalsegmentator.bin.TotalSegmentator"] + cmd
         result = subprocess.run(full_cmd, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
             print(f"    [TotalSegmentator] ⚠️  {label} hatası: {result.stderr[-300:] if result.stderr else ''}")
@@ -126,16 +128,16 @@ def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True)
             print(f"    [TotalSegmentator] ❌ Python API hatası: {e}")
             return False
 
-    # Adım 2: Karaciğer tümörü (opsiyonel — ayrı model, fast modda çalışmaz)
+    # Adım 2: Karaciğer tümörü (opsiyonel)
     print(f"    [TotalSegmentator] Adım 2/2: Tümör tespiti (opsiyonel)...")
     tumor_cmd = ["-i", nifti_path, "-o", ts_output_dir,
                  "--roi_subset", "liver_tumor", "--task", "total"]
     tumor_ok = run_cmd(tumor_cmd, "Tümör")
     if not tumor_ok:
-        print(f"    [TotalSegmentator] ℹ️  Tümör modeli yok/uyumsuz → sadece karaciğer maskesi kullanılacak")
+        print(f"    [TotalSegmentator] ℹ️  Tümör modeli atlandı → karaciğer parankim maskesi kullanılacak")
 
     print(f"    [TotalSegmentator] ✅ Segmentasyon tamamlandı")
-    return liver_ok  # Karaciğer başarılıysa devam et
+    return liver_ok
 
 
 
@@ -231,6 +233,8 @@ def process_all_patients(dicom_root: str, output_dir: str, fast_mode: bool = Tru
         nifti_out = str(nifti_dir / f"{patient_id}.nii.gz")
         try:
             convert_dicom_to_nifti(dicom_dir, str(nifti_dir), f"{patient_id}.nii.gz")
+            if not os.path.exists(nifti_out):
+                raise FileNotFoundError(f"NIfTI dosyası oluşturulamadı: {nifti_out}")
             print(f"    [1/3] ✅ NIfTI dönüşümü OK")
         except Exception as e:
             print(f"    [1/3] ❌ NIfTI dönüşümü başarısız: {e}")
