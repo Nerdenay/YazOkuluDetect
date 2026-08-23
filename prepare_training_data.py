@@ -333,6 +333,7 @@ def process_all_patients(dicom_root: str, output_dir: str, fast_mode: bool = Tru
 
         results.append({
             "id": patient_id,
+            "source_folder": rel_label,
             "status": "OK" if ts_ok else "UYARI",
             "liver_voxels": stats["liver_voxels"],
             "lesion_voxels": stats["lesion_voxels"],
@@ -340,7 +341,15 @@ def process_all_patients(dicom_root: str, output_dir: str, fast_mode: bool = Tru
         })
         print()
 
-    # 5. dataset.json üret (prepare_nnunet_data.py fonksiyonu) ───────────────
+    # 5. patient_mapping.json ve dataset.json üret ───────────────────────────
+    mapping_file = str(output_path / "patient_mapping.json")
+    try:
+        with open(mapping_file, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        print(f"[INFO] Hasta eşleme tablosu kaydedildi: {mapping_file}")
+    except Exception as e:
+        print(f"[UYARI] patient_mapping.json yazılamadı: {e}")
+
     ok_count = sum(1 for r in results if r["status"] == "OK")
     generate_dataset_json(
         dataset_dir=nnunet_paths["dataset_dir"],
