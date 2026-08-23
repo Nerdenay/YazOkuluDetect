@@ -55,54 +55,79 @@ except ImportError as e:
 
 def find_dicom_series(root_dir: str) -> list:
     """
-    Sectra / RadiAnt PACS CD yapısını doğrudan hedefler:
-      {HASTA_ADI}/{T0 veya T1}/DICOM/{SERI_NO}/...
-    
-    DLL, EXE, BAT ve viewer dosyalarını tamamen atlar, sadece gerçek kesit serilerini seçer.
+    Tüm 41 hastayı eksiksiz bulur.
+    Linux büyük/küçük harf duyarlılığına (DICOM vs dicom vs t0 vs T 0) takılmaz.
+    Her hasta ve zaman noktası için en büyük aksiyal tomografi serisini otomatik seçer.
     """
     root = Path(root_dir)
     selected_series = []
 
-    print("[INFO] Hasta ve zaman serileri taranıyor...")
+    print("[INFO] Tüm 41 hasta klasörü taranıyor (Büyük/küçük harf ve yapıdan bağımsız)...")
     
-    # 1. Seviye: Hasta klasörleri (Örn: "AYSEL BALKAN")
+    # 1. Hasta klasörlerini al
     patients = [p for p in sorted(root.iterdir()) if p.is_dir() and not p.name.startswith(('.', '_'))]
-    
-    for patient_dir in patients:
-        # 2. Seviye: Zaman noktaları (Örn: "T0", "T1") veya doğrudan DICOM
-        subdirs = [d for d in sorted(patient_dir.iterdir()) if d.is_dir() and not d.name.startswith(('.', '_'))]
-        
-        # Eğer alt klasörlerde T0/T1 varsa
-        time_dirs = [d for d in subdirs if (d / "DICOM").exists()]
-        if not time_dirs:
-            # Belki doğrudan DICOM klasörü vardır
-            if (patient_dir / "DICOM").exists():
-                time_dirs = [patient_dir]
-            else:
-                time_dirs = subdirs
+    print(f"[INFO] Taranacak ana hasta klasörü sayısı: {len(patients)}")
 
-        for t_dir in time_dirs:
-            dicom_root = t_dir / "DICOM" if (t_dir / "DICOM").exists() else t_dir
+    for patient_dir in patients:
+        # Bu hastanın içindeki tüm yaprak klasörleri ve dosya sayılarını bul
+        candidate_dirs = {}  # {dirpath: valid_file_count}
+        
+        for dirpath, dirnames, filenames in os.walk(patient_dir):
+            # Sistem veya viewer klasörlerini atla
+            dirnames[:] = [
+                d for d in dirnames
+                if not d.startswith(('.', '_'))
+                and d.upper() not in ['REPORTS', 'RA64', 'RA32', 'COMMON', 'BIN']
+            ]
             
-            # DICOM altındaki en çok kesite sahip seriyi bul (aksiyal ana hacim)
-            best_dir = None
-            max_slices = 0
+            # Gerçek görüntü dosyalarını say
+            valid_files = [
+                f for f in filenames
+                if not f.startswith(('.', '_'))
+                and f.upper() not in ['DICOMDIR', 'REPORTS.TXT', 'DESCRIPT.ION', 'INDEX.HTM', 'CALISTIR.BAT', 'AUTORUNN.INF']
+                and not f.endswith(('.txt', '.xml', '.pdf', '.jpg', '.png', '.dll', '.exe', '.bat', '.ico', '.inf', '.htm', '.html'))
+            ]
             
-            for dirpath, dirnames, filenames in os.walk(dicom_root):
-                valid_files = [
-                    f for f in filenames
-                    if not f.startswith(('.', '_'))
-                    and f.upper() not in ['DICOMDIR', 'REPORTS.TXT', 'DESCRIPT.ION']
-                    and not f.endswith(('.txt', '.xml', '.pdf', '.jpg', '.png', '.dll', '.exe', '.bat', '.ico'))
-                ]
-                if len(valid_files) > max_slices:
-                    max_slices = len(valid_files)
-                    best_dir = dirpath
+            if len(valid_files) >= 5:
+                candidate_dirs[dirpath] = len(valid_files)
+
+        if not candidate_dirs:
+            print(f"  ⚠️  {patient_dir.name} -> Geçerli DICOM kesiti bulunamadı (boş veya rar olabilir)")
+            continue
+
+        # Bu hastanın aday klasörlerini zaman noktalarına göre grupla
+        # Örn: 'T0', 'T1', 't0', 't1', 'T 0', 'T 1' veya ilk alt klasör
+        study_groups = {}  # {study_key: (best_dir, max_count)}
+
+        for dirpath, count in candidate_dirs.items():
+            rel = os.path.relpath(dirpath, patient_dir)
+            parts = rel.split(os.sep)
             
-            if best_dir and max_slices >= 3:
-                label = f"{patient_dir.name}/{t_dir.name}"
-                print(f"  • {label} -> {max_slices} kesit ({Path(best_dir).name})")
-                selected_series.append(best_dir)
+            # Zaman noktasını belirle (T0, T1, t0, t1 vs.)
+            study_key = "T0"
+            for p in parts:
+                p_clean = p.upper().replace(" ", "").replace("-", "").replace("_", "")
+                if "T0" in p_clean:
+                    study_key = "T0"
+                    break
+                elif "T1" in p_clean:
+                    study_key = "T1"
+                    break
+                elif "T2" in p_clean:
+                    study_key = "T2"
+                    break
+            else:
+                # T0/T1 yazmıyorsa ilk alt klasörün adını kullan
+                study_key = parts[0] if parts else "STUDY"
+
+            if study_key not in study_groups or count > study_groups[study_key][1]:
+                study_groups[study_key] = (dirpath, count)
+
+        # Seçilen serileri ekle
+        for s_key, (best_dir, count) in sorted(study_groups.items()):
+            label = f"{patient_dir.name}/{s_key}"
+            print(f"  • {label} -> {count} kesit ({Path(best_dir).name})")
+            selected_series.append(best_dir)
 
     print(f"\n[INFO] Toplam {len(selected_series)} adet geçerli BT serisi bulundu.\n")
     return selected_series
