@@ -55,29 +55,44 @@ except ImportError as e:
 
 def find_dicom_series(root_dir: str) -> list:
     """
-    Verilen klasörün altındaki tüm DICOM serilerini bulur.
-    - .dcm uzantılı dosyalar içeren klasörleri tarar
-    - Sectra PACS DICOMDIR yapısını da destekler
+    Verilen ana klasörün altındaki tüm hasta çekim klasörlerini (T0, T1, DICOM) bulur.
+    Çift kayıtları ve gereksiz alt klasör tekrarlarını temizler.
     """
-    series_dirs = []
+    series_dirs = set()
     root = Path(root_dir)
 
-    for path in sorted(root.rglob("*.dcm")):
-        parent = str(path.parent)
-        if parent not in series_dirs:
-            series_dirs.append(parent)
-
-    # DICOMDIR desteği (Sectra PACS exportu)
+    # 1. DICOMDIR içeren ana klasörler
     for path in sorted(root.rglob("DICOMDIR")):
-        parent = str(path.parent)
-        if parent not in series_dirs:
-            series_dirs.append(parent)
+        series_dirs.add(str(path.parent))
 
-    # Eğer alt klasörlerde .dcm yoksa, doğrudan alt klasörleri dene
+    # 2. .dcm içeren klasörler (eğer üst klasörü zaten eklenmemişse)
+    for path in sorted(root.rglob("*.dcm")):
+        parent = path.parent
+        # Eğer parent'ın üst klasörlerinden biri zaten DICOMDIR ile eklendiyse atla
+        is_covered = any(str(parent).startswith(d) for d in series_dirs)
+        if not is_covered:
+            series_dirs.add(str(parent))
+
+    # 3. Eğer hiçbiri bulunamadıysa doğrudan 1. ve 2. seviye alt klasörleri tara
     if not series_dirs:
-        series_dirs = [str(d) for d in root.iterdir() if d.is_dir()]
+        for p1 in root.iterdir():
+            if p1.is_dir():
+                subdirs = [p2 for p2 in p1.iterdir() if p2.is_dir()]
+                if subdirs:
+                    for p2 in subdirs:
+                        series_dirs.add(str(p2))
+                else:
+                    series_dirs.add(str(p1))
 
-    return sorted(series_dirs)
+    # Gereksiz iç içe alt klasörleri temizle (ana klasörü koru)
+    cleaned = sorted(list(series_dirs))
+    final_dirs = []
+    for d in cleaned:
+        # Eğer daha üst bir ana klasör listede varsa bu alt klasörü atla
+        if not any(d != other and d.startswith(other + os.sep) for other in cleaned):
+            final_dirs.append(d)
+
+    return sorted(final_dirs) if final_dirs else cleaned
 
 
 def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True) -> bool:

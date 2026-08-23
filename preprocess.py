@@ -31,48 +31,101 @@ def convert_dicom_to_nifti(dicom_dir: str, output_dir: str, output_filename: str
     except Exception as e:
         print(f"[INFO] dicom2nifti deneniyor, SimpleITK fallback'e geçiliyor... ({e})")
 
-    # 2. Yöntem: SimpleITK ImageSeriesReader (PACS ve uzantısız dosyalar için en sağlamı)
+    # 2. Yöntem: SimpleITK ImageSeriesReader
     try:
         reader = sitk.ImageSeriesReader()
+        all_dicom_files = []
         
-        # Klasörün içindeki ve alt klasörlerdeki serileri tara
-        series_ids = reader.GetGDCMSeriesIDs(dicom_dir)
-        
-        # Eğer doğrudan bulunamadıysa alt klasörlere bak
-        target_dir = dicom_dir
-        if not series_ids:
-            for root, dirs, files in os.walk(dicom_dir):
-                ids = reader.GetGDCMSeriesIDs(root)
-                if ids:
-                    series_ids = ids
-                    target_dir = root
-                    break
+        for root, dirs, files in os.walk(dicom_dir):
+            if not files:
+                continue
+            series_ids = reader.GetGDCMSeriesIDs(root)
+            for sid in series_ids:
+                fnames = reader.GetGDCMSeriesFileNames(root, sid)
+                if len(fnames) > len(all_dicom_files):
+                    all_dicom_files = fnames
 
-        if not series_ids:
-            raise RuntimeError(f"DICOM serisi bulunamadı: {dicom_dir}")
+        if all_dicom_files and len(all_dicom_files) >= 5:
+            reader.SetFileNames(all_dicom_files)
+            image = reader.Execute()
+            sitk.WriteImage(image, output_path)
+            print(f"[SUCCESS] DICOM -> NIfTI dönüşümü tamamlandı (SimpleITK: {len(all_dicom_files)} kesit).")
+            return output_path
+    except Exception as e:
+        print(f"[INFO] SimpleITK deneniyor, pydicom motoruna geçiliyor... ({e})")
 
-        # En çok kesite sahip olan seriyi seç (aksiyal ana hacim)
-        best_series = None
-        max_files = 0
-        for sid in series_ids:
-            files = reader.GetGDCMSeriesFileNames(target_dir, sid)
-            if len(files) > max_files:
-                max_files = len(files)
-                best_series = sid
+    # 3. Yöntem: pydicom + nibabel (Sectra PACS ve uzantısız dosyalar için %100 garantili)
+    try:
+        import pydicom
+        import nibabel as nib
 
-        if not best_series or max_files == 0:
-            raise RuntimeError(f"Geçerli DICOM kesiti bulunamadı: {dicom_dir}")
+        series_dict = {}
+        for root, dirs, files in os.walk(dicom_dir):
+            for f in files:
+                fpath = os.path.join(root, f)
+                if f.upper() in ["DICOMDIR", "REPORTS", ".DS_STORE"] or f.endswith((".txt", ".xml", ".pdf")):
+                    continue
+                try:
+                    ds = pydicom.dcmread(fpath, stop_before_pixels=True, force=True)
+                    if hasattr(ds, "SeriesInstanceUID") and hasattr(ds, "ImagePositionPatient"):
+                        sid = ds.SeriesInstanceUID
+                        if sid not in series_dict:
+                            series_dict[sid] = []
+                        series_dict[sid].append(fpath)
+                except Exception:
+                    continue
 
-        dicom_files = reader.GetGDCMSeriesFileNames(target_dir, best_series)
-        reader.SetFileNames(dicom_files)
-        image = reader.Execute()
+        if not series_dict:
+            raise RuntimeError(f"Hiçbir geçerli DICOM kesiti bulunamadı: {dicom_dir}")
 
-        sitk.WriteImage(image, output_path)
-        print(f"[SUCCESS] DICOM -> NIfTI dönüşümü tamamlandı (SimpleITK: {max_files} kesit).")
+        # En çok kesite sahip seriyi seç (aksiyal ana hacim)
+        best_sid = max(series_dict.keys(), key=lambda k: len(series_dict[k]))
+        selected_files = series_dict[best_sid]
+
+        if len(selected_files) < 3:
+            raise RuntimeError(f"Yetersiz kesit sayısı ({len(selected_files)}): {dicom_dir}")
+
+        # Kesitleri z-pozisyonuna göre sırala
+        slices = []
+        for fp in selected_files:
+            try:
+                ds = pydicom.dcmread(fp, force=True)
+                slices.append(ds)
+            except Exception:
+                pass
+
+        slices.sort(key=lambda s: float(s.ImagePositionPatient[2]) if hasattr(s, "ImagePositionPatient") else float(getattr(s, "InstanceNumber", 0)))
+
+        # 3D Piksel matrisini ve HU değerlerini oluştur
+        images = []
+        for s in slices:
+            arr = s.pixel_array.astype(np.float32)
+            slope = float(getattr(s, "RescaleSlope", 1.0))
+            intercept = float(getattr(s, "RescaleIntercept", 0.0))
+            hu = arr * slope + intercept
+            images.append(hu)
+
+        volume = np.stack(images, axis=-1)  # (Y, X, Z)
+        volume = np.swapaxes(volume, 0, 1)  # (X, Y, Z)
+
+        # Spacing ve Oryantasyon
+        ps = slices[0].PixelSpacing if hasattr(slices[0], "PixelSpacing") else [1.0, 1.0]
+        if len(slices) > 1 and hasattr(slices[0], "ImagePositionPatient") and hasattr(slices[1], "ImagePositionPatient"):
+            dz = abs(float(slices[1].ImagePositionPatient[2]) - float(slices[0].ImagePositionPatient[2]))
+            if dz == 0:
+                dz = float(getattr(slices[0], "SliceThickness", 1.0))
+        else:
+            dz = float(getattr(slices[0], "SliceThickness", 1.0))
+
+        affine = np.diag([float(ps[0]), float(ps[1]), float(dz), 1.0])
+        nii = nib.Nifti1Image(volume.astype(np.int16), affine)
+        nib.save(nii, output_path)
+
+        print(f"[SUCCESS] DICOM -> NIfTI dönüşümü tamamlandı (pydicom: {len(slices)} kesit, boyut: {volume.shape}).")
         return output_path
 
     except Exception as e:
-        print(f"[ERROR] Dönüşüm başarısız oldu: {str(e)}")
+        print(f"[ERROR] Tüm dönüştürücüler başarısız oldu: {str(e)}")
         if os.path.exists(output_path):
             os.remove(output_path)
         raise
