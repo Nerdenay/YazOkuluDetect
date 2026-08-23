@@ -1,10 +1,70 @@
 # Yapay Zeka Destekli Onkolojik BT Analizi — Uçtan Uca RECIST 1.1 Karar Destek Sistemi
 
-> **Son Güncelleme:** 03 Ağustos 2026  
+> **Son Güncelleme:** 18 Ağustos 2026  
 > **Kapsam:** Etiketlenmemiş Sectra PACS DICOM çiftleri → Longitudinal RECIST 1.1 Kararı  
 > **Hedef Organ:** Üst Batın (Abdomen-Üst), Kontrastlı BT, 0.625 mm ince kesit
 
---- 
+---
+
+## 📝 17 Ağustos 2026 Oturum Notları
+
+### Arayüz Yeniden Tasarımı (Tamamlandı ✅)
+- Eski arayüzde 3 ayrı buton ve manuel SOD girişi vardı — doktor kullanıma uygun değildi.
+- Yeni arayüz: **"Tek Tetkik"** ve **"Longitudinal (t0+t1)"** mod seçici sekme.
+- t0 ve t1 yüklenince **PatientID otomatik karşılaştırılıyor** → aynı hastaysa ✅, farklıysa ⚠️ uyarısı.
+- Tek "Analizi Başlat" butonu → `/pipeline` veya `/pipeline-single` otomatik çağrılıyor.
+- Manuel SOD girişi kaldırıldı — değerler pipeline JSON'dan otomatik geliyor.
+- Değişiklikler GitHub'a push edildi: `feat(ui): longitudinal mode ve pipeline entegrasyonu`
+
+### B-Spline Registration Hızlandırma (Geçici ⚠️)
+- Test ortamında B-Spline registration çok uzun sürdüğü için parametreler hızlandırıldı.
+- Grid spacing: 50mm → **80mm**, iterasyon: 100 → **50**, maxEval: 1000 → **300**
+- **Eğitim sonrası klinik moda alınması gerekiyor** (Bkz. "Eğitim Sonrası Yapılacaklar" bölümü)
+
+### Etiketleme (Pseudo-labeling) Stratejisi
+**Sistemin eğitim için neye ihtiyacı var:**
+- Her hasta için: `hasta_XXX.nii.gz` (BT) + `hasta_XXX_mask.nii.gz` (lezyon maskesi)
+- Maske elle çizilmiyor — **TotalSegmentator** otomatik üretiyor, hoca 3D Slicer'da onaylıyor.
+
+**İş bölümü:**
+| Adım | Kim Yapıyor | Süre |
+|---|---|---|
+| DICOM → NIfTI | Sen (`preprocess.py`) | Otomatik |
+| Taslak maske üretimi | TotalSegmentator (otomatik) | ~2-3 saat |
+| Maske onaylama | **Hoca (3D Slicer'da)** | ~10 dk/hasta |
+| nnU-Net formatı | Sen (`prepare_nnunet_data.py`) | Otomatik |
+| Training | RunPod GPU | ~12-24 saat |
+
+**Doktor müsait değilse:** TotalSegmentator maskelerini onaysız kullanarak direkt eğitime başlanabilir.
+- Avantaj: Proje bloke olmaz, pipeline test edilir
+- Dezavantaj: Küçük lezyonlar (<10mm) kaçırılabilir, Dice skoru düşük çıkar
+- Öneri: İlk iterasyonu onaysız yap, hoca zamanı olunca 5-10 vakayı onaylayıp fine-tune et
+
+### Veri Boyutu Problemi
+- Ham DICOM verisi ~256GB → lokal bilgisayara yüklenemez
+- Çözüm: Hoca bilgisayarında DICOM → NIfTI dönüşümü yapılır (~50-80GB'a düşer)
+- NIfTI verisi **RunPod** veya **üniversite HPC**'ye yüklenir, training orada yapılır
+- Eğitim bittikten sonra sadece `checkpoint_final.pth` (~200-500MB) indirilir
+
+### Doğruluk Metrikleri
+- **Segmentasyon doğruluğu:** Dice Skoru (0.0-1.0, >0.85 hedef)
+- **RECIST ölçüm doğruluğu:** ICC katsayısı (sistem vs. radyolog çap ölçümü)
+- **Klinik karar doğruluğu:** Cohen's Kappa (PD/PR/SD/CR kararı uyumu)
+- Şu an model eğitilmemiş → Dice = N/A. Eğitim sonrası nnU-Net otomatik hesaplar.
+
+### Raporların Değeri
+- REPORTS klasöründeki radyoloji raporları formal RECIST değil, genel radyoloji raporu.
+- İçinde ölçüm değerleri var (örn. "%33 küçülmüş, 10mm LAP") ama PD/PR/SD/CR yok.
+- Sistem bu ölçümleri alıp **formal RECIST 1.1 kararı üretiyor** — hocanın yapmadığı formalizasyon budur.
+
+### Yarınki Toplantı İçin Sorular
+1. Kaç hasta çifti (t0+t1) var?
+2. Önceden çizilmiş segmentasyon maskesi var mı?
+3. GPU erişimi: RunPod mu, üniversite HPC mi?
+4. Hoca 3D Slicer onay sürecine dahil olabilir mi?
+
+---
+
 
 ## Genel Bakış
 
