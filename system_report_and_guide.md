@@ -1,8 +1,8 @@
-# RECIST 1.1 Karar Destek Sistemi — Mimari Raporu ve Model Eğitimi Rehberi
+# HepaRECIST-AI: 4D Longitudinal Abdominal Tümör Takibi ve Otomatik RECIST 1.1 Tedavi Yanıtı Değerlendirme Platformu
 
-## 📖 BÖLÜM 1: Sistem Mimarı ve Faz Bazlı Fonksiyonel Rapor
+## 📖 BÖLÜM 1: Sistem Mimarisi ve Faz Bazlı Fonksiyonel Rapor
 
-Sistemimiz, medikal BT taramalarından karaciğer tümör/metastaz tespiti yapıp RECIST 1.1 standartlarına uygun deterministik klinik kararlar üreten ve bunu akıcı raporlara dönüştüren **5 Fazlı Tam Katmanlı Yazılım Mimarisine** sahiptir.
+Sistemimiz, medikal BT taramalarından 3D organ ve tümör/metastaz tespiti yapıp RECIST 1.1 standartlarına uygun deterministik tedavi yanıtı analizi üreten ve bunu akıcı raporlara dönüştüren **5 Fazlı Tam Katmanlı Yazılım Mimarisine** sahiptir.
 
 ```
                   ┌─────────────────────────────────────────────────────────┐

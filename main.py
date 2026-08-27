@@ -82,7 +82,7 @@ class ReportRequest(BaseModel):
     use_llm: bool = False
     llm_api_key: str = ""
 
-# --- ENDPOINTS (API UÇ NOKTALARI) ---
+# --- ENDPOINTS (API UÇ NOKTALARI) --- NEBİ ERDENAY ÇUBUKÇU
 
 @app.get("/", tags=["Sistem"])
 def read_root():

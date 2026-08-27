@@ -1,7 +1,7 @@
-# Yapay Zeka Destekli Onkolojik BT Analizi — RECIST 1.1 Karar Destek Sistemi
+# HepaRECIST-AI: 4D Longitudinal Abdominal Tümör Takibi ve Otomatik RECIST 1.1 Tedavi Yanıtı Değerlendirme Platformu
 ## 🚀 Hızlı Başlangıç ve Çalıştırma Rehberi (How-To-Run)
 
-Bu proje, BT (Bilgisayarlı Tomografi) taramalarından 3D karaciğer tümör/metastaz tespiti, komşu patoloji ayrımı (Radiomics), 2 zamanlı lezyon takibi (Registration + Hungarian Algorithm) ve RECIST 1.1 standartlarında deterministik karar desteği sunan uçtan uca bir klinik karar destek sistemidir.
+Bu proje, BT (Bilgisayarlı Tomografi) taramalarından 3D organ ve tümör/metastaz tespiti, komşu patoloji ayrımı (Radiomics), çok zamanlı boylamsal lezyon takibi (B-Spline Registration + Hungarian Algorithm) ve RECIST 1.1 standartlarında deterministik tedavi yanıtı analizi sunan uçtan uca otomatik bir onkolojik analiz platformudur.
 
 Proje 2 temel bileşenden oluşmaktadır:
 1. **Python FastAPI Backend Sunucusu:** AI modellerini, görüntü işleme ve karar motorunu çalıştırır (`http://127.0.0.1:8000`).
