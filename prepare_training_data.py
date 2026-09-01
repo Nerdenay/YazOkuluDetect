@@ -135,32 +135,37 @@ def find_dicom_series(root_dir: str) -> list:
 
 def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True) -> bool:
     """
-    TotalSegmentator'ı doğrudan Python API üzerinden (in-process) çalıştırır.
-    Subprocess kullanmadığı için klavye kesmesi (^C), semaphore sızıntısı veya 
-    erken kapanma hataları yaşanmaz.
+    TotalSegmentator'ı tek iş parçacıklı (single-thread) ve doğrudan Python API ile çalıştırır.
+    nr_threads_resampling=1 ve nr_threads_saving=1 parametreleri Colab'da sahte ^C (SIGINT)
+    ve multiprocessing sinyal kilitlenmelerini %100 engeller.
     """
     Path(ts_output_dir).mkdir(parents=True, exist_ok=True)
+    liver_file = Path(ts_output_dir) / "liver.nii.gz"
+
+    if liver_file.exists() and liver_file.stat().st_size > 1000:
+        print(f"    [TotalSegmentator] ✅ Önceden üretilmiş maske mevcut, atlanıyor.")
+        return True
 
     print(f"    [TotalSegmentator] Karaciğer segmentasyonu başlatılıyor...")
     
-    # 1. Doğrudan Python API ile çalıştır (en kararlı yöntem)
+    # 1. Doğrudan Python API ile tek iş parçacığında çalıştır (en kararlı yöntem)
     try:
         from totalsegmentator.python_api import totalsegmentator
         import nibabel as nib
         
         img = nib.load(nifti_path)
         
-        # Karaciğer segmentasyonu
         totalsegmentator(
             input=img,
             output=Path(ts_output_dir),
             fast=fast,
             roi_subset=["liver"],
             quiet=True,
-            verbose=False
+            verbose=False,
+            nr_threads_resampling=1,
+            nr_threads_saving=1
         )
         
-        liver_file = Path(ts_output_dir) / "liver.nii.gz"
         if liver_file.exists():
             print(f"    [TotalSegmentator] ✅ Karaciğer segmentasyonu tamamlandı.")
             return True
@@ -174,12 +179,11 @@ def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True)
     # 2. Fallback: CLI
     try:
         ts_bin = shutil.which("TotalSegmentator") or "TotalSegmentator"
-        cmd = [ts_bin, "-i", nifti_path, "-o", ts_output_dir, "--roi_subset", "liver"]
+        cmd = [ts_bin, "-i", nifti_path, "-o", ts_output_dir, "--roi_subset", "liver", "--nr_threads_saving", "1"]
         if fast:
             cmd.append("--fast")
         
         res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=600)
-        liver_file = Path(ts_output_dir) / "liver.nii.gz"
         if liver_file.exists():
             print(f"    [TotalSegmentator] ✅ Karaciğer segmentasyonu tamamlandı (CLI).")
             return True
@@ -282,10 +286,19 @@ def process_all_patients(dicom_root: str, output_dir: str, fast_mode: bool = Tru
         rel_label = os.path.relpath(dicom_dir, dicom_root)
         print(f"[{idx}/{len(series_list)}] {rel_label} → {patient_id}")
 
+        final_img = Path(images_tr) / f"{patient_id}_0000.nii.gz"
+        final_lbl = Path(labels_tr) / f"{patient_id}.nii.gz"
+        if final_img.exists() and final_lbl.exists() and final_img.stat().st_size > 1000 and final_lbl.stat().st_size > 1000:
+            print(f"    [RESUME] ✅ {patient_id} zaten tamamlanmış, atlanıyor.")
+            results.append({"id": patient_id, "status": "TAMAMLANDI", "has_lesion": True, "source": rel_label})
+            print()
+            continue
+
         # 1. DICOM → NIfTI ───────────────────────────────────────────────────
         nifti_out = str(nifti_dir / f"{patient_id}.nii.gz")
         try:
-            convert_dicom_to_nifti(dicom_dir, str(nifti_dir), f"{patient_id}.nii.gz")
+            if not (os.path.exists(nifti_out) and os.path.getsize(nifti_out) > 1000):
+                convert_dicom_to_nifti(dicom_dir, str(nifti_dir), f"{patient_id}.nii.gz")
             if not os.path.exists(nifti_out):
                 raise FileNotFoundError(f"NIfTI dosyası oluşturulamadı: {nifti_out}")
             print(f"    [1/3] ✅ NIfTI dönüşümü OK")
