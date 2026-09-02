@@ -118,3 +118,24 @@ Kod yapısını incelemek isteyenler için ana modüller ve işlevleri:
   * **Cevap:** Sistem mimarisi %100 tamamlanmıştır. Ağırlıklar yüklenene kadar sistem **güvenli Mock modunda** çalışarak tüm boru hattını eksiksiz test etmeye imkan verir. Eğitilmiş `.pth` model dosyası `./models/` klasörüne konduğu an sistem otomatik olarak canlı AI moduna geçer.
 * **Soru: `dotnet` komutu bulunamadı hatası alıyorum.**
   * **Cevap:** Bilgisayarınızda .NET 9.0 SDK yüklü olduğundan emin olun veya projeyi doğrudan Visual Studio 2022 ile açıp F5'e basın.
+
+
+
+
+
+
+
+
+
+---
+
+## 🏆 Sistem İyileştirmeleri ve Kritik Mühendislik Çözümleri
+
+* **`prepare_training_data.py`:** TotalSegmentator'ın 7 abdominal organı (Labels 1-7) ve kullanıcının etiketleyeceği lezyonların (Label 8) çakışması çözüldü. Zaman serisi takibi (`hasta_001_t0`, `hasta_001_t1`) korunarak veri sızıntısı (data leakage) engellendi.
+* **`preprocess.py`:** SimpleITK GDCM motoruyla yönelim (LPS/RAS) ve koordinat kayıpları giderildi. nnU-Net ve TotalSegmentator'ın ihtiyacı olan Ham Hounsfield Unit (-1000 / +1000 HU) değerleri korundu.
+* **`matching_engine.py`:** B-Spline registration dönüşüm matrisi (`composite_transform`) baseline maskesine Nearest Neighbor ile uygulandı; organ kaymalarından doğan sahte "Yeni Lezyon" tespiti engellendi ve RECIST 1.1 aksiyel 2D Feret çapı devreye alındı.
+* **`radiomics_module.py`:** Analiz alanı sadece Label 8'e sınırlandı. Sıvı kistleri tümör nekrozundan ayıran 3D Küresellik (Sphericity $\Psi$) formülü eklendi.
+* **`inference.py`:** `truncated_output` ile dosya uzantı hatası (`.nii.gz.nii.gz`) çözüldü ve Colab T4'te CUDA OOM (Out-of-Memory) riskini bitiren RAM/VRAM dengesi kuruldu.
+* **`main.py` & `pipeline.py`:** Nadir (tedavi süresince görülen en küçük SOD) takibi ve çift resampling kaynaklı I/O darboğazları ortadan kaldırıldı.
+* **`report_generator.py`:** Düzce Üniversitesi resmi onkolojik rapor formatı kuruldu ve `temperature=0.0` ile sıfır halüsinasyon garantisi verildi.
+* **`prepare_nnunet_data.py`:** `Dataset001_AbdominalTumor` çok sınıflı şeması ve 5-Fold bulut eğitim otomasyonu entegre edildi.

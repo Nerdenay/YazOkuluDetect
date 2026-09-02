@@ -1,264 +1,166 @@
+"""
+preprocess.py
+=============
+HepaRECIST-AI - Faz 1: DICOM Ön İşleme ve Standardizasyon Modülü
+- 1. Tercih: dicom2nifti (standart dönüşüm + RAS reorientation)
+- 2. Tercih (Fallback): SimpleITK ImageSeriesReader (PACS uyumlu, yönelim ve koordinatları tam korur)
+- Ham HU değerlerini korur (TotalSegmentator ve nnU-Net için zorunludur).
+"""
+
 import os
 import sys
-import dicom2nifti
-import SimpleITK as sitk
+import shutil
+from pathlib import Path
 import numpy as np
+import SimpleITK as sitk
+
+try:
+    import dicom2nifti
+    import dicom2nifti.settings as d2n_settings
+    # Çok katı DICOM geometri kontrollerini esnet (PACS serilerinde çökmemesi için)
+    d2n_settings.disable_validate_slice_increment()
+except ImportError:
+    dicom2nifti = None
+
 
 def convert_dicom_to_nifti(dicom_dir: str, output_dir: str, output_filename: str) -> str:
     """
-    Belirtilen DICOM klasöründeki kesitleri okur ve tek bir .nii.gz (NIfTI) dosyasına dönüştürür.
-    Sectra PACS ve farklı DICOM formatları için hem dicom2nifti hem de SimpleITK motorunu destekler.
+    DICOM serisini koordinat, yönelim ve spacing kaybı olmadan NIfTI (.nii.gz) formatına çevirir.
+    Önce dicom2nifti dener; hata verirse SimpleITK GDCM motoruna geçer.
     """
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir, exist_ok=True)
-        
+    os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, output_filename)
-    print(f"[INFO] DICOM serisi dönüştürülüyor: {dicom_dir} -> {output_path}")
+    print(f"[INFO] DICOM dönüştürülüyor: {dicom_dir} -> {output_path}")
 
-    # 1. Yöntem: dicom2nifti (en basit, bazen birden fazla dosya üretir)
+    # 1. Yöntem: dicom2nifti
+    if dicom2nifti is not None:
+        temp_d2n_dir = os.path.join(output_dir, "_tmp_d2n")
+        os.makedirs(temp_d2n_dir, exist_ok=True)
+        try:
+            dicom2nifti.convert_directory(dicom_dir, temp_d2n_dir, compression=True, reorient=True)
+            generated = [f for f in os.listdir(temp_d2n_dir) if f.endswith('.nii.gz')]
+            
+            if generated:
+                # Birden fazla seri üretildiyse en büyük boyutluyu (ana aksiyal BT) seç
+                generated.sort(key=lambda f: os.path.getsize(os.path.join(temp_d2n_dir, f)), reverse=True)
+                best_file = os.path.join(temp_d2n_dir, generated[0])
+                
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+                shutil.move(best_file, output_path)
+                shutil.rmtree(temp_d2n_dir, ignore_errors=True)
+
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+                    print("[SUCCESS] dicom2nifti ile başarıyla dönüştürüldü.")
+                    return output_path
+        except Exception as e:
+            print(f"[INFO] dicom2nifti uyarı/hata: {e}. SimpleITK fallback deneniyor...")
+        finally:
+            shutil.rmtree(temp_d2n_dir, ignore_errors=True)
+
+    # 2. Yöntem: SimpleITK ImageSeriesReader (PACS ve uzantısız dosyalar için en sağlam motor)
     try:
-        dicom2nifti.convert_directory(dicom_dir, output_dir, compression=True, reorient=True)
+        reader = sitk.ImageSeriesReader()
+        dicom_names = reader.GetGDCMSeriesFileNames(dicom_dir)
         
-        # dicom2nifti birden fazla seri üretebilir → EN BÜYÜK dosyayı (ana CT) al
-        generated_files = [
-            f for f in os.listdir(output_dir)
-            if f.endswith('.nii.gz') and f != output_filename
-        ]
-        if generated_files:
-            # Boyuta göre sırala — en büyük = ana aksiyal CT serisi
-            generated_files.sort(
-                key=lambda f: os.path.getsize(os.path.join(output_dir, f)),
-                reverse=True
-            )
-            best_path = os.path.join(output_dir, generated_files[0])
-            if os.path.exists(output_path):
-                os.remove(output_path)
-            os.rename(best_path, output_path)
-            
-            # Geri kalan küçük serileri temizle
-            for extra_file in generated_files[1:]:
-                extra_path = os.path.join(output_dir, extra_file)
-                if os.path.exists(extra_path):
-                    os.remove(extra_path)
-                    
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            print("[SUCCESS] DICOM -> NIfTI dönüşümü tamamlandı (dicom2nifti).")
-            return output_path
-            
-    except Exception as e:
-        print(f"[INFO] dicom2nifti başarısız, pydicom motoruna geçiliyor... ({type(e).__name__})")
-        for f in os.listdir(output_dir):
-            if f.endswith('.nii.gz') and f != output_filename:
-                try:
-                    os.remove(os.path.join(output_dir, f))
-                except Exception:
-                    pass
+        # Eğer GetGDCMSeriesFileNames dosyaları bulamazsa klasördeki tüm dosyaları zorla ver
+        if not dicom_names:
+            all_files = [
+                os.path.join(dicom_dir, f) for f in os.listdir(dicom_dir)
+                if not f.startswith(('.', '_')) and f.upper() not in ["DICOMDIR"]
+                and not f.endswith(('.txt', '.xml', '.pdf', '.jpg', '.png'))
+            ]
+            if not all_files:
+                raise RuntimeError(f"Klasörde işlenebilecek DICOM dosyası bulunamadı: {dicom_dir}")
+            dicom_names = tuple(all_files)
 
-    # 2. Yöntem: pydicom + nibabel (uzantısız Sectra dosyaları dahil)
-    try:
-        import pydicom
-        import nibabel as nib
+        reader.SetFileNames(dicom_names)
+        reader.MetaDataDictionaryArrayUpdateOn()
+        reader.LoadPrivateTagsOn()
+        
+        image = reader.Execute()
 
-        # Tüm DICOM dosyalarını tara — ImagePositionPatient ZORUNLU DEĞİL
-        all_candidates = []
-        for root, dirs, files in os.walk(dicom_dir):
-            dirs[:] = [d for d in dirs if not d.startswith('.')]
-            for f in files:
-                if f.upper() in ["DICOMDIR", ".DS_STORE"] or f.endswith((".txt", ".xml", ".pdf", ".jpg")):
-                    continue
-                fpath = os.path.join(root, f)
-                try:
-                    ds = pydicom.dcmread(fpath, stop_before_pixels=True, force=True)
-                    # En az PixelData olduğunu doğrulamak için Rows/Columns kontrolü
-                    if hasattr(ds, "Rows") and hasattr(ds, "Columns") and hasattr(ds, "SeriesInstanceUID"):
-                        all_candidates.append((ds.SeriesInstanceUID, fpath, ds))
-                except Exception:
-                    continue
-
-        if not all_candidates:
-            raise RuntimeError(f"Hiçbir geçerli DICOM kesiti bulunamadı: {dicom_dir}")
-
-        # En çok kesite sahip seriyi seç
-        from collections import Counter
-        series_counts = Counter(c[0] for c in all_candidates)
-        best_sid = series_counts.most_common(1)[0][0]
-        selected = [(fp, ds) for sid, fp, ds in all_candidates if sid == best_sid]
-
-        if len(selected) < 3:
-            raise RuntimeError(f"Yetersiz kesit sayısı ({len(selected)}): {dicom_dir}")
-
-        # Z-pozisyonu yoksa InstanceNumber ile sırala
-        def sort_key(item):
-            ds = item[1]
-            if hasattr(ds, "ImagePositionPatient"):
-                return float(ds.ImagePositionPatient[2])
-            return float(getattr(ds, "InstanceNumber", 0))
-
-        selected.sort(key=sort_key)
-
-        # Piksel verilerini yükle
-        slices = []
-        for fp, _ in selected:
-            try:
-                ds = pydicom.dcmread(fp, force=True)
-                slices.append(ds)
-            except Exception:
-                pass
-
-        if len(slices) < 3:
-            raise RuntimeError(f"Yeterli kesit okunamadı: {len(slices)}")
-
-        images = []
-        for s in slices:
-            arr = s.pixel_array.astype(np.float32)
-            slope = float(getattr(s, "RescaleSlope", 1.0))
-            intercept = float(getattr(s, "RescaleIntercept", 0.0))
-            images.append(arr * slope + intercept)
-
-        volume = np.stack(images, axis=-1)
-        volume = np.swapaxes(volume, 0, 1)
-
-        ps = slices[0].PixelSpacing if hasattr(slices[0], "PixelSpacing") else [1.0, 1.0]
-        if len(slices) > 1 and hasattr(slices[0], "ImagePositionPatient") and hasattr(slices[1], "ImagePositionPatient"):
-            dz = abs(float(slices[1].ImagePositionPatient[2]) - float(slices[0].ImagePositionPatient[2]))
-            dz = dz if dz > 0 else float(getattr(slices[0], "SliceThickness", 1.0))
-        else:
-            dz = float(getattr(slices[0], "SliceThickness", 1.0))
-
-        affine = np.diag([float(ps[0]), float(ps[1]), float(dz), 1.0])
-        nib.save(nib.Nifti1Image(volume.astype(np.int16), affine), output_path)
-        print(f"[SUCCESS] DICOM -> NIfTI tamamlandı (pydicom: {len(slices)} kesit, boyut: {volume.shape}).")
+        # SimpleITK LPS koordinat sistemindedir; DICOM yönelimini tam korur
+        sitk.WriteImage(image, output_path)
+        print(f"[SUCCESS] SimpleITK ile dönüştürüldü (Boyut: {image.GetSize()}, Spacing: {image.GetSpacing()})")
         return output_path
 
     except Exception as e:
-        print(f"[ERROR] Tüm dönüştürücüler başarısız: {str(e)}")
+        print(f"[FATAL] SimpleITK dönüşümü de başarısız oldu: {e}")
         if os.path.exists(output_path):
             os.remove(output_path)
         raise
 
-def apply_windowing(nifti_path: str, output_path: str, window_level: int = 40, window_width: int = 150) -> str:
-    """
-    NIfTI görüntüsüne Hounsfield Unit (HU) pencereleme (clipping) uygular 
-    ve veriyi [0, 1] aralığına normalize eder.
-    
-    Karaciğer / Yumuşak doku için varsayılan: WL=40, WW=150 (Aralık: -35 ile 115 HU)
-    
-    Args:
-        nifti_path (str): Giriş NIfTI dosyasının yolu.
-        output_path (str): Çıkış NIfTI dosyasının yolu.
-        window_level (int): Pencere seviyesi (Center).
-        window_width (int): Pencere genişliği (Width).
-        
-    Returns:
-        str: İşlenmiş NIfTI dosyasının yolu.
-    """
-    print(f"[INFO] HU Pencereleme uygulanıyor (WL: {window_level}, WW: {window_width})...")
-    
-    try:
-        # SimpleITK ile görüntüyü oku
-        image = sitk.ReadImage(nifti_path)
-        
-        volume = sitk.GetArrayFromImage(image)
-        
-        min_hu = window_level - (window_width / 2)
-        max_hu = window_level + (window_width / 2)
-        
-        clipped_volume = np.clip(volume, min_hu, max_hu)
-        
-        normalized_volume = (clipped_volume - min_hu) / (max_hu - min_hu)
-        
-        processed_image = sitk.GetImageFromArray(normalized_volume.astype(np.float32))
-        
-        processed_image.CopyInformation(image)
-        
-        sitk.WriteImage(processed_image, output_path)
-        print(f"[SUCCESS] Pencereleme ve normalizasyon tamamlandı: {output_path}")
-        return output_path
-        
-    except Exception as e:
-        print(f"[ERROR] Pencereleme sırasında hata oluştu: {str(e)}")
-        raise
 
 def resample_image(image_path: str, output_path: str, new_spacing: tuple = (1.0, 1.0, 1.0), is_label: bool = False) -> str:
     """
-    Bir görüntüyü (veya maskeyi) belirtilen hedef spacing (voxel boyutu) değerine yeniden örnekler (resample).
-    
-    Args:
-        image_path (str): Giriş NIfTI görüntüsünün yolu.
-        output_path (str): Çıkış NIfTI görüntüsünün yolu.
-        new_spacing (tuple): Hedef spacing (x, y, z) milimetre cinsinden. Varsayılan (1.0, 1.0, 1.0).
-        is_label (bool): Görüntü maske/etiket ise True olmalıdır. Bu durumda Nearest Neighbor interpolasyonu kullanılır.
-        
-    Returns:
-        str: Yeniden örneklenmiş görüntünün kaydedildiği yol.
+    Görüntüyü izotropik spacing'e (örn: 1.0x1.0x1.0 mm) resample eder.
+    nnU-Net kendi resampling'ini yaptığı için bu işlem genellikle Faz 4 (Longitudinal Registration)
+    öncesinde T0-T1 eşitlemesi için kullanılır.
     """
-    print(f"[INFO] Resampling uygulanıyor: {image_path} -> Spacing: {new_spacing}")
-    
+    print(f"[INFO] Resampling uygulanıyor: Spacing -> {new_spacing}")
     try:
         image = sitk.ReadImage(image_path)
         original_spacing = image.GetSpacing()
         original_size = image.GetSize()
-        
-        # Eğer orijinal spacing ile hedef spacing zaten aynıysa işlem yapmadan kaydet/kopyala
-        if np.allclose(original_spacing, new_spacing):
-            print("[INFO] Görüntü zaten hedef spacing değerine sahip. İşlem atlanıyor.")
-            sitk.WriteImage(image, output_path)
+
+        if np.allclose(original_spacing, new_spacing, atol=1e-3):
+            if image_path != output_path:
+                sitk.WriteImage(image, output_path)
             return output_path
-            
-        # Yeni boyutu hesapla: yeni_boyut = eski_boyut * (eski_spacing / yeni_spacing)
+
         new_size = [
             int(round(original_size[i] * original_spacing[i] / new_spacing[i]))
             for i in range(3)
         ]
-        
-        # Resampling filtresini yapılandır
+
         resample = sitk.ResampleImageFilter()
         resample.SetSize(new_size)
         resample.SetOutputSpacing(new_spacing)
         resample.SetOutputOrigin(image.GetOrigin())
         resample.SetOutputDirection(image.GetDirection())
-        
-        # Interpolatör seçimi (Görüntü ve maske için farklı filtreler kullanılır)
-        if is_label:
-            resample.SetInterpolator(sitk.sitkNearestNeighbor)  # Maske için
-        else:
-            resample.SetInterpolator(sitk.sitkLinear)  # CT görüntüsü için
-            
-        # Filtreyi çalıştır ve kaydet
+        resample.SetInterpolator(sitk.sitkNearestNeighbor if is_label else sitk.sitkLinear)
+
         resampled_image = resample.Execute(image)
         sitk.WriteImage(resampled_image, output_path)
-        
-        print(f"[SUCCESS] Resampling tamamlandı. Boyut: {original_size} -> {new_size}")
         return output_path
-        
     except Exception as e:
-        print(f"[ERROR] Resampling sırasında hata oluştu: {str(e)}")
+        print(f"[ERROR] Resampling hatası: {e}")
         raise
+
+
+def apply_windowing_for_visualization(nifti_path: str, output_path: str, wl: int = 40, ww: int = 150,
+                                      window_level: int = None, window_width: int = None) -> str:
+    """
+    SADECE UI / Görselleştirme amaçlıdır! (TotalSegmentator veya nnU-Net eğitimine SOKULMAZ).
+    Yumuşak doku penceresi uygulayıp [0, 1] aralığına çeker.
+    """
+    if window_level is not None:
+        wl = window_level
+    if window_width is not None:
+        ww = window_width
+
+    image = sitk.ReadImage(nifti_path)
+    volume = sitk.GetArrayFromImage(image)
+
+    min_hu = wl - (ww / 2.0)
+    max_hu = wl + (ww / 2.0)
+
+    clipped = np.clip(volume, min_hu, max_hu)
+    normalized = (clipped - min_hu) / (max_hu - min_hu)
+
+    proc_img = sitk.GetImageFromArray(normalized.astype(np.float32))
+    proc_img.CopyInformation(image)
+    sitk.WriteImage(proc_img, output_path)
+    return output_path
+
+# Geriye dönük uyumluluk takma adı (main.py ve pipeline.py için)
+apply_windowing = apply_windowing_for_visualization
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 4:
-        print("Kullanım: python preprocess.py <dicom_klasor_yolu> <cikti_klasor_yolu> <cikti_dosya_adi>")
-        print("Örnek: python preprocess.py ./sample_dicom ./output patient_baseline.nii.gz")
+        print("Kullanım: python preprocess.py <dicom_klasor> <cikti_klasor> <dosya_adi.nii.gz>")
     else:
-        dicom_in = sys.argv[1]
-        out_dir = sys.argv[2]
-        filename = sys.argv[3]
-        
-        try:
-            # 1. Adım: DICOM -> NIfTI
-            raw_nifti = convert_dicom_to_nifti(dicom_in, out_dir, "raw_" + filename)
-            
-            # 2. Adım: HU Windowing & Normalizasyon
-            windowed_nifti = os.path.join(out_dir, "windowed_" + filename)
-            apply_windowing(raw_nifti, windowed_nifti)
-            
-            # 3. Adım: Resampling (Hedef: 1.0mm x 1.0mm x 1.0mm)
-            final_nifti = os.path.join(out_dir, filename)
-            resample_image(windowed_nifti, final_nifti, new_spacing=(1.0, 1.0, 1.0), is_label=False)
-            
-            # Geçici dosyaları temizle
-            os.remove(raw_nifti)
-            os.remove(windowed_nifti)
-            print("[INFO] İşlem başarıyla sonlandı. Son çıktı:", final_nifti)
-        except Exception as ex:
-            print(f"[FATAL] Hata: {ex}")
+        # Ham HU değerleriyle NIfTI üretir (Doğrudan TotalSegmentator & nnU-Net uyumlu)
+        convert_dicom_to_nifti(sys.argv[1], sys.argv[2], sys.argv[3])

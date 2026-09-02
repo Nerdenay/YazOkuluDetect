@@ -1,38 +1,54 @@
+"""
+radiomics_module.py
+===================
+HepaRECIST-AI - Faz 3: Radyomik Doku Doğrulama ve Güven Skoru Motoru
+- 3D Lezyon Segmentasyonu (Label 8) Doğrulama
+- HU İstatistikleri: Mean, Std, Median, P10, P25, P75, P90, IQR
+- Morfolojik Özellikler: Hacim (mm³), Fiziksel Centroid (LPS), 3D Küresellik (Sphericity Ψ)
+- Kural Tabanlı Sınıflandırma: Malign (Tümör/Metastaz), Benign (Kist), Vasküler/Kireçlenme
+- Güven Skoru (<0.75 ise Hekim Onay Kuyruğu Flag'i)
+"""
+
 import os
-import SimpleITK as sitk
 import numpy as np
+import SimpleITK as sitk
 from scipy import ndimage
 from typing import Dict, List, Any
 
 
-def analyze_ct_and_mask_radiomics(ct_nifti_path: str, mask_nifti_path: str) -> Dict[str, Any]:
+def calculate_3d_sphericity(binary_region: np.ndarray, spacing: tuple) -> float:
     """
-    AI segmentasyon maskesindeki her bir 3D lezyon adayı için Radyomik özellik çıkarımı
-    ve kural tabanlı sınıflandırma yapar.
+    3D Küresellik (Sphericity Ψ) Katsayısını hesaplar:
+        Ψ = (π^(1/3) * (6 * Hacim)^(2/3)) / Yüzey_Alanı
+    Değer aralığı: (0, 1]. Mükemmel küre = 1.0.
+    """
+    voxel_vol = spacing[0] * spacing[1] * spacing[2]
+    volume_mm3 = float(np.sum(binary_region) * voxel_vol)
+    
+    if volume_mm3 <= 0:
+        return 0.0
 
-    Lezyon adayları üç sınıfa ayrılır:
-        Malign (Tümör/Metastaz) : Orta-yüksek HU (25-95 HU), yüksek doku heterojenliği.
-        Benign (Kist)           : Düşük HU (0-22 HU), homojen sıvı yapısı.
-        Vasküler / Kireçlenme   : Çok yüksek HU (≥120 HU).
+    # 3D Morfolojik Gradyan / Erozyon ile yüzey piksellerini çıkar
+    eroded = ndimage.binary_erosion(binary_region)
+    surface_mask = binary_region ^ eroded
+    surface_voxel_count = int(np.sum(surface_mask))
 
-    Çıkarılan radyomik özellikler:
-        - Yoğunluk (HU) istatistikleri: mean, std, min, max, P25, P75.
-        - Şekil: Kütle merkezi (centroid), hacim (mm³).
-        - Doku heterojenliği: Normalize standart sapma (hu_std / |hu_mean|).
+    if surface_voxel_count == 0:
+        return 1.0
 
-    Güven skoru <0.75 ise lezyon adayı otomatik olarak Radyolog Onay Kuyruğu'na alınır.
+    # Yaklaşık yüzey alanı (mm²)
+    mean_face_area = (spacing[0]*spacing[1] + spacing[1]*spacing[2] + spacing[0]*spacing[2]) / 3.0
+    surface_area_mm2 = surface_voxel_count * mean_face_area
 
-    Args:
-        ct_nifti_path   : Ham HU değerlerini içeren BT NIfTI dosyasının yolu.
-                          (preprocess.py çıktısı: raw_hu_*.nii.gz)
-        mask_nifti_path : AI segmentasyon maskesi NIfTI dosyasının yolu.
+    # Sphericity formülü
+    psi = (np.pi ** (1.0 / 3.0) * ((6.0 * volume_mm3) ** (2.0 / 3.0))) / (surface_area_mm2 + 1e-5)
+    return round(float(np.clip(psi, 0.0, 1.0)), 3)
 
-    Returns:
-        status                      : "success"
-        total_candidate_regions     : Analiz edilen lezyon adayı sayısı.
-        regions                     : Her lezyon için sınıflandırma sonuçları listesi.
-        requires_radiologist_review : En az bir düşük güvenli lezyon varsa True.
-        preview_image_path          : Üretilen 2D BT kesit PNG görselinin yolu.
+
+def analyze_ct_and_mask_radiomics(ct_nifti_path: str, mask_nifti_path: str, lesion_label_id: int = 8) -> Dict[str, Any]:
+    """
+    Maskedeki Lezyon (varsayılan Label 8, yoksa 2 veya 1) bölgeleri için 
+    radyomik analiz ve malignite sınıflandırması yapar.
     """
     if not os.path.exists(ct_nifti_path):
         raise FileNotFoundError(f"BT NIfTI dosyası bulunamadı: {ct_nifti_path}")
@@ -42,12 +58,21 @@ def analyze_ct_and_mask_radiomics(ct_nifti_path: str, mask_nifti_path: str) -> D
     ct_img = sitk.ReadImage(ct_nifti_path)
     mask_img = sitk.ReadImage(mask_nifti_path)
 
-    ct_arr = sitk.GetArrayFromImage(ct_img)     # Eksen: (Z, Y, X)
-    mask_arr = sitk.GetArrayFromImage(mask_img)  # Eksen: (Z, Y, X)
-    spacing = ct_img.GetSpacing()               # (x_mm, y_mm, z_mm)
+    ct_arr = sitk.GetArrayFromImage(ct_img)    # (Z, Y, X)
+    mask_arr = sitk.GetArrayFromImage(mask_img)
+    spacing = ct_img.GetSpacing()              # (sx, sy, sz)
+    voxel_vol = spacing[0] * spacing[1] * spacing[2]
 
-    # Maskedeki birbirinden bağımsız 3D lezyon adaylarını etiketle
-    labeled_mask, num_regions = ndimage.label(mask_arr > 0)
+    # Eğer belirtilen etiket maskede yoksa alternatif etiketleri kontrol et
+    unique_vals = set(np.unique(mask_arr))
+    if lesion_label_id not in unique_vals:
+        for alt_id in [2, 1]:
+            if alt_id in unique_vals:
+                lesion_label_id = alt_id
+                break
+
+    lesion_binary = (mask_arr == lesion_label_id)
+    labeled_mask, num_regions = ndimage.label(lesion_binary)
 
     regions_analysis = []
 
@@ -55,47 +80,42 @@ def analyze_ct_and_mask_radiomics(ct_nifti_path: str, mask_nifti_path: str) -> D
         region_voxels = (labeled_mask == region_id)
         voxel_count = int(np.sum(region_voxels))
 
-        # 10 voxel'den küçük alanlar muhtemelen gürültüdür, atla
-        if voxel_count < 10:
+        if voxel_count < 15:  # Küçük artefaktları atla
             continue
 
         region_hu = ct_arr[region_voxels]
 
-        # --- 1. HU Yoğunluk İstatistikleri ---
+        # 1. HU İstatistikleri
         hu_mean = float(np.mean(region_hu))
         hu_std = float(np.std(region_hu))
+        hu_p25 = float(np.percentile(region_hu, 25))
+        hu_p75 = float(np.percentile(region_hu, 75))
+        hu_iqr = float(hu_p75 - hu_p25)  # Güvenilir heterojenlik metriği
 
-        # --- 2. Şekil Özellikleri ---
-        voxel_vol_mm3 = spacing[0] * spacing[1] * spacing[2]
-        volume_mm3 = float(voxel_count * voxel_vol_mm3)
+        # 2. Şekil ve Küresellik
+        volume_mm3 = float(voxel_count * voxel_vol)
+        sphericity = calculate_3d_sphericity(region_voxels, spacing)
 
-        centroid_voxels = ndimage.center_of_mass(region_voxels)
-        centroid_mm = [
-            float(centroid_voxels[2] * spacing[0]),  # X ekseni
-            float(centroid_voxels[1] * spacing[1]),  # Y ekseni
-            float(centroid_voxels[0] * spacing[2])   # Z ekseni
-        ]
+        # Fiziksel Uzayda Kütle Merkezi (SimpleITK LPS)
+        centroid_zyx = ndimage.center_of_mass(region_voxels)
+        physical_centroid = ct_img.TransformContinuousIndexToPhysicalPoint([centroid_zyx[2], centroid_zyx[1], centroid_zyx[0]])
 
-        # --- 3. Doku Heterojenliği ---
-        # Normalize standart sapma: yüksek değer = heterojen doku = malign lehine
-        texture_entropy = float(hu_std / (abs(hu_mean) + 1e-5))
-
-        # --- 4. Kural Tabanlı Sınıflandırma ---
-        label, confidence = _classify_region(hu_mean, hu_std, texture_entropy, volume_mm3)
-
-        # Güven skoru %75 altındaysa radyolog incelemesi gerekir
+        # 3. Kural Tabanlı Sınıflandırma
+        label, confidence = _classify_region_advanced(hu_mean, hu_std, hu_iqr, sphericity, volume_mm3)
         needs_review = confidence < 0.75
 
         regions_analysis.append({
             "region_id": region_id,
-            "centroid_mm": [round(c, 2) for c in centroid_mm],
+            "centroid_mm": [round(c, 2) for c in physical_centroid],
             "volume_mm3": round(volume_mm3, 2),
+            "sphericity_psi": sphericity,
             "hu_mean": round(hu_mean, 1),
             "hu_std": round(hu_std, 1),
+            "hu_iqr": round(hu_iqr, 1),
             "classification": label,
             "confidence_score": round(confidence, 2),
             "needs_review": needs_review,
-            "explanation": _build_explanation(label, hu_mean, hu_std, confidence)
+            "explanation": _build_explanation(label, hu_mean, hu_std, sphericity, confidence)
         })
 
     result = {
@@ -105,68 +125,54 @@ def analyze_ct_and_mask_radiomics(ct_nifti_path: str, mask_nifti_path: str) -> D
         "requires_radiologist_review": any(r["needs_review"] for r in regions_analysis)
     }
 
-    # Radiomics sonuçlarıyla birlikte 2D BT kesit görselini üret
+    # Görselleştirme preview (Varsa)
     try:
         from visualizer import generate_lesion_visualization
         preview_png = mask_nifti_path.replace(".nii.gz", "_radiomics_preview.png")
-        generate_lesion_visualization(
-            ct_nifti_path=ct_nifti_path,
-            mask_nifti_path=mask_nifti_path,
-            radiomics_results=result,
-            output_png_path=preview_png
-        )
+        generate_lesion_visualization(ct_nifti_path, mask_nifti_path, result, preview_png)
         result["preview_image_path"] = preview_png
-    except Exception as exc:
-        print(f"[WARNING] Radiomics kesit görseli üretilemedi: {exc}")
+    except Exception:
         result["preview_image_path"] = ""
 
     return result
 
 
-def _classify_region(
-    hu_mean: float,
-    hu_std: float,
-    texture_entropy: float,
-    volume_mm3: float
-) -> tuple:
+def _classify_region_advanced(hu_mean: float, hu_std: float, hu_iqr: float, 
+                              sphericity: float, volume_mm3: float) -> tuple:
     """
-    Radyomik özelliklere göre üç sınıftan birini ve güven skorunu döndürür.
-
-    Sınıflandırma mantığı:
-        Kist     : hu_mean ≤ 22 HU VE hu_std < 12 (homojen sıvı)
-        Vasküler : hu_mean ≥ 120 HU (kontrast madde veya kireçlenme)
-        Malign   : 25 ≤ hu_mean ≤ 95 HU (tümöral yoğunluk aralığı)
-                   -> Yüksek std (>16) varsa güçlü malign, yoksa sınırda malign.
-        Belirsiz : Yukarıdakilerin dışında kalan alanlar, radyolog onayı gerekir.
-
-    Returns:
-        (sınıf_etiketi, güven_skoru) tuple'ı.
+    HU yoğunluğu, doku heterojenliği (IQR/Std) ve 3D Küresellik (Ψ) ile karar verir.
     """
-    if hu_mean <= 22.0 and hu_std < 12.0:
-        return "Benign (Kist)", 0.92
+    # 1. Kist: Düşük HU, düşük varyasyon VE yüksek küresellik (küreye yakın sıvı kesesi)
+    if hu_mean <= 22.0 and hu_std < 14.0 and sphericity >= 0.78:
+        return "Benign (Basit Kist)", 0.94
 
+    # Sınırda kist (Düşük HU ama küresellik sınırda)
+    if hu_mean <= 25.0 and hu_std < 16.0:
+        return "Benign (Olası Kist / Nekroz)", 0.72
+
+    # 2. Vasküler / Kireçlenme: Yüksek kontrastlanma
     if hu_mean >= 120.0:
-        return "Vasküler / Kireçlenme", 0.88
+        return "Vasküler / Kalsifiye Odak", 0.90
 
+    # 3. Malign (Tümör / Metastaz): Karaciğerde hipodens/izodens tümöral aralık
     if 25.0 <= hu_mean <= 95.0:
-        if hu_std > 16.0:
-            return "Malign (Tümör/Metastaz)", 0.89
+        # Malign lezyonlar düzensiz kenarlıdır (düşük sphericity) ve doku içi heterojendir (yüksek IQR/Std)
+        if hu_iqr > 18.0 or hu_std > 16.0:
+            conf = 0.88 if sphericity < 0.82 else 0.76
+            return "Malign (Tümör/Metastaz)", conf
         else:
-            return "Malign (Şüpheli)", 0.68
+            # Homojen solid lezyon (Adenoma, FNH veya düşük heterojenlikli metastaz)
+            return "Solid Lezyon (Şüpheli)", 0.65
 
-    return "Belirsiz / Karışık Yapı", 0.55
+    return "Belirsiz / Atipik Doku", 0.50
 
 
-def _build_explanation(label: str, hu_mean: float, hu_std: float, confidence: float) -> str:
-    """Sınıflandırma kararına açıklama metni üretir."""
-    if "Benign" in label:
-        return f"Düşük yoğunluk ({hu_mean:.1f} HU) ve homojen doku yapısı kist ile uyumludur."
+def _build_explanation(label: str, hu_mean: float, hu_std: float, sphericity: float, confidence: float) -> str:
+    """Klinik karar gerekçesi metni."""
+    if "Kist" in label and confidence >= 0.75:
+        return f"Sıvı dansitesi ({hu_mean:.1f} HU) ve yüksek 3D küresellik (Ψ={sphericity:.2f}) basit kist lehinedir."
     if "Vasküler" in label:
-        return f"Yüksek kontrastlanma ({hu_mean:.1f} HU) damarsal veya kalsifiye yapıyı düşündürmektedir."
-    if "Malign" in label and confidence >= 0.75:
-        return f"Düzensiz doku dağılımı (std={hu_std:.1f} HU) ve tümöral yoğunluk ({hu_mean:.1f} HU) malign süreç lehinedir."
-    return f"Sınırda değerler ({hu_mean:.1f} HU). Kesin değerlendirme için radyolog onayı gerekmektedir."
-
-
-if __name__ == "__main__":
-    print("=== Radiomics Sınıflandırma Modülü (radiomics_module.py) ===")
+        return f"Belirgin yüksek dansite ({hu_mean:.1f} HU) damarsal yapı veya kireçlenmeyi düşündürmektedir."
+    if "Malign" in label:
+        return f"Tümöral dansite ({hu_mean:.1f} HU), heterojen iç yapı (std={hu_std:.1f}) ve invaziv kenar (Ψ={sphericity:.2f}) malign süreç ile uyumludur."
+    return f"Dansite ({hu_mean:.1f} HU) veya şekil (Ψ={sphericity:.2f}) sınırda değerdedir. Hekim onayı önerilir."
