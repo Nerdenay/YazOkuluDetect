@@ -133,60 +133,81 @@ def find_dicom_series(root_dir: str) -> list:
     return selected_series
 
 
+# Ana batın organları listesi (TotalSegmentator)
+ABDOMINAL_ROIS = ["liver", "spleen", "kidney_right", "kidney_left", "pancreas", "gallbladder", "stomach", "aorta"]
+
+ORGAN_LABEL_MAP = {
+    "liver": 1,
+    "spleen": 2,
+    "kidney_right": 3,
+    "kidney_left": 3,  # Sağ ve sol böbrek birleşik Label 3
+    "pancreas": 4,
+    "gallbladder": 5,
+    "stomach": 6,
+    "aorta": 7,
+    "lesion": 8
+}
+
 def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True) -> bool:
     """
-    TotalSegmentator'ı doğrudan Python API üzerinden (in-process) çalıştırır.
+    TotalSegmentator'ı izole bir alt işlem (subprocess) olarak çalıştırır.
+    Tüm ana batın organlarını (karaciğer, dalak, böbrekler, pankreas, safra kesesi, mide, aorta) etiketler.
     """
     Path(ts_output_dir).mkdir(parents=True, exist_ok=True)
     liver_file = Path(ts_output_dir) / "liver.nii.gz"
 
     if liver_file.exists() and liver_file.stat().st_size > 1000:
-        print(f"    [TotalSegmentator] ✅ Önceden üretilmiş maske mevcut, atlanıyor.")
+        print(f"    [TotalSegmentator] ✅ Önceden üretilmiş batın maskeleri mevcut, atlanıyor.")
         return True
 
-    print(f"    [TotalSegmentator] Karaciğer segmentasyonu başlatılıyor...")
-    
-    # 1. Doğrudan Python API ile çalıştır (en kararlı yöntem)
+    print(f"    [TotalSegmentator] Batın organları ve lezyon segmentasyonu başlatılıyor...")
+
+    # 1. İzole CLI Subprocess (En kararlı ve kesintisiz yöntem)
+    try:
+        ts_bin = shutil.which("TotalSegmentator")
+        roi_args = ["--roi_subset"] + ABDOMINAL_ROIS
+        if ts_bin:
+            cmd = [ts_bin, "-i", nifti_path, "-o", ts_output_dir] + roi_args + ["--quiet"]
+        else:
+            cmd = [sys.executable, "-m", "totalsegmentator.bin.TotalSegmentator", "-i", nifti_path, "-o", ts_output_dir] + roi_args + ["--quiet"]
+
+        if fast:
+            cmd.append("--fast")
+
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=1200)
+        
+        if liver_file.exists() and liver_file.stat().st_size > 1000:
+            print(f"    [TotalSegmentator] ✅ Batın organları segmentasyonu tamamlandı.")
+            return True
+        else:
+            err_msg = res.stderr[-300:].strip() if res.stderr else "Bilinmeyen hata"
+            print(f"    [TotalSegmentator] ⚠️  CLI uyarısı: {err_msg}, Python API deneniyor...")
+
+    except Exception as e:
+        print(f"    [TotalSegmentator] CLI alt işlem hatası: {e}, Python API deneniyor...")
+
+    # 2. Fallback: Doğrudan Python API
     try:
         from totalsegmentator.python_api import totalsegmentator
         import nibabel as nib
         
         img = nib.load(nifti_path)
-        
         totalsegmentator(
             input=img,
             output=Path(ts_output_dir),
             fast=fast,
-            roi_subset=["liver"],
+            roi_subset=ABDOMINAL_ROIS,
             quiet=True,
             verbose=False
         )
         
-        if liver_file.exists():
-            print(f"    [TotalSegmentator] ✅ Karaciğer segmentasyonu tamamlandı.")
+        if liver_file.exists() and liver_file.stat().st_size > 1000:
+            print(f"    [TotalSegmentator] ✅ Batın organları segmentasyonu tamamlandı (Python API).")
             return True
         else:
-            print(f"    [TotalSegmentator] ⚠️  liver.nii.gz üretilemedi.")
+            print(f"    [TotalSegmentator] ❌ Batın maskeleri üretilemedi.")
             return False
 
-    except Exception as e:
-        print(f"    [TotalSegmentator] Python API hatası: {e}, CLI deneniyor...")
-
-    # 2. Fallback: CLI
-    try:
-        ts_bin = shutil.which("TotalSegmentator") or "TotalSegmentator"
-        cmd = [ts_bin, "-i", nifti_path, "-o", ts_output_dir, "--roi_subset", "liver"]
-        if fast:
-            cmd.append("--fast")
-        
-        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=600)
-        if liver_file.exists():
-            print(f"    [TotalSegmentator] ✅ Karaciğer segmentasyonu tamamlandı (CLI).")
-            return True
-        else:
-            print(f"    [TotalSegmentator] ❌ Segmentasyon başarısız: {res.stderr[-200:] if res.stderr else 'Bilinmeyen hata'}")
-            return False
-            
     except Exception as e:
         print(f"    [TotalSegmentator] ❌ Genel hata: {e}")
         return False
@@ -195,10 +216,16 @@ def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True)
 
 def merge_organ_labels(ts_output_dir: str, merged_mask_path: str) -> dict:
     """
-    TotalSegmentator'ın ayrı organ NIfTI dosyalarını birleştirir:
+    TotalSegmentator'ın tüm batın organlarını tek bir 3D maskede birleştirir:
       Label 0: Arka plan
-      Label 1: Karaciğer parankimi
-      Label 2: Lezyon / Tümör
+      Label 1: Karaciğer (Liver)
+      Label 2: Dalak (Spleen)
+      Label 3: Böbrekler (Kidneys)
+      Label 4: Pankreas (Pancreas)
+      Label 5: Safra Kesesi (Gallbladder)
+      Label 6: Mide (Stomach)
+      Label 7: Aorta (Aorta)
+      Label 8: Tümör / Lezyon (Lesions)
 
     Returns: İstatistik dict (voxel sayıları)
     """
@@ -207,31 +234,58 @@ def merge_organ_labels(ts_output_dir: str, merged_mask_path: str) -> dict:
 
     ts_dir = Path(ts_output_dir)
     liver_path = ts_dir / "liver.nii.gz"
-    tumor_path = ts_dir / "liver_tumor.nii.gz"
 
-    stats = {"liver_voxels": 0, "lesion_voxels": 0, "has_lesion": False}
+    stats = {
+        "liver_voxels": 0, "spleen_voxels": 0, "kidney_voxels": 0,
+        "pancreas_voxels": 0, "stomach_voxels": 0, "lesion_voxels": 0,
+        "has_lesion": False, "total_organ_voxels": 0
+    }
 
     if not liver_path.exists():
         print(f"    [Birleştirme] ⚠️  liver.nii.gz bulunamadı, boş maske üretiliyor")
         return stats
 
-    liver_img = nib.load(str(liver_path))
-    liver_data = liver_img.get_fdata().astype("uint8")
-    merged = np.zeros_like(liver_data, dtype="uint8")
-    merged[liver_data > 0] = 1
-    stats["liver_voxels"] = int(np.sum(liver_data > 0))
+    ref_img = nib.load(str(liver_path))
+    ref_data = ref_img.get_fdata().astype("uint8")
+    merged = np.zeros_like(ref_data, dtype="uint8")
 
-    if tumor_path.exists():
-        tumor_data = nib.load(str(tumor_path)).get_fdata().astype("uint8")
-        merged[tumor_data > 0] = 2
-        stats["lesion_voxels"] = int(np.sum(tumor_data > 0))
-        stats["has_lesion"] = stats["lesion_voxels"] > 0
+    # Tüm batın organlarını sırayla katmana yaz
+    for roi, label_idx in ORGAN_LABEL_MAP.items():
+        if roi == "lesion":
+            continue
+        roi_file = ts_dir / f"{roi}.nii.gz"
+        if roi_file.exists():
+            roi_data = nib.load(str(roi_file)).get_fdata()
+            merged[roi_data > 0] = label_idx
+            vox_count = int(np.sum(roi_data > 0))
+            if roi == "liver":
+                stats["liver_voxels"] = vox_count
+            elif roi == "spleen":
+                stats["spleen_voxels"] = vox_count
+            elif "kidney" in roi:
+                stats["kidney_voxels"] += vox_count
+            elif roi == "pancreas":
+                stats["pancreas_voxels"] = vox_count
+            elif roi == "stomach":
+                stats["stomach_voxels"] = vox_count
 
-    print(f"    [Birleştirme] Karaciğer: {stats['liver_voxels']:,} voxel | "
-          f"Lezyon: {stats['lesion_voxels']:,} voxel "
-          f"({'✅ Bulundu' if stats['has_lesion'] else '⚪ Temiz'})")
+    # Varsa lezyonları en üst katmana Label 8 olarak bas
+    tumor_candidates = ["liver_tumor.nii.gz", "tumor.nii.gz", "lesion.nii.gz"]
+    for tc in tumor_candidates:
+        t_file = ts_dir / tc
+        if t_file.exists():
+            t_data = nib.load(str(t_file)).get_fdata()
+            merged[t_data > 0] = 8
+            stats["lesion_voxels"] += int(np.sum(t_data > 0))
+            stats["has_lesion"] = True
 
-    nib.save(nib.Nifti1Image(merged, liver_img.affine, liver_img.header), merged_mask_path)
+    stats["total_organ_voxels"] = int(np.sum(merged > 0))
+
+    print(f"    [Birleştirme] Karaciğer: {stats['liver_voxels']:,} | Dalak: {stats['spleen_voxels']:,} | "
+          f"Böbrek: {stats['kidney_voxels']:,} | Pankreas: {stats['pancreas_voxels']:,} | "
+          f"Lezyon: {stats['lesion_voxels']:,} voxel")
+
+    nib.save(nib.Nifti1Image(merged, ref_img.affine, ref_img.header), merged_mask_path)
     return stats
 
 
@@ -362,7 +416,17 @@ def process_all_patients(dicom_root: str, output_dir: str, fast_mode: bool = Tru
     generate_dataset_json(
         dataset_dir=nnunet_paths["dataset_dir"],
         num_training_cases=ok_count,
-        labels={"background": 0, "liver": 1, "lesion": 2}
+        labels={
+            "background": 0,
+            "liver": 1,
+            "spleen": 2,
+            "kidneys": 3,
+            "pancreas": 4,
+            "gallbladder": 5,
+            "stomach": 6,
+            "aorta": 7,
+            "lesion": 8
+        }
     )
 
     # ── Özet rapor ────────────────────────────────────────────────────────────
@@ -370,7 +434,7 @@ def process_all_patients(dicom_root: str, output_dir: str, fast_mode: bool = Tru
     lesion_cases = sum(1 for r in results if r.get("has_lesion"))
 
     print(f"\n{'='*60}")
-    print(f"  ÖZET RAPOR")
+    print(f"  ÖZET RAPOR — Multi-Organ Abdominal Cavity Dataset")
     print(f"{'='*60}")
     print(f"  Toplam seri        : {len(series_list)}")
     print(f"  Başarılı           : {ok_count}")
@@ -380,8 +444,8 @@ def process_all_patients(dicom_root: str, output_dir: str, fast_mode: bool = Tru
     print(f"\n  nnU-Net klasörü    : {nnunet_paths['dataset_dir']}")
     print(f"    imagesTr/        : {ok_count} dosya")
     print(f"    labelsTr/        : {ok_count} dosya")
-    print(f"    dataset.json     : ✅")
-    print(f"\n  ⚠️  Maskeleri 3D Slicer'da kontrol ettirmeyi unutmayın!")
+    print(f"    dataset.json     : ✅ (8 Abdominal Sınıf + Lezyon)")
+    print(f"\n  ⚠️  Maskeleri 3D Slicer / ITK-SNAP ortamında kontrol edebilirsiniz!")
     print(f"{'='*60}\n")
 
     errors = [r for r in results if r["status"] != "OK"]
@@ -390,8 +454,8 @@ def process_all_patients(dicom_root: str, output_dir: str, fast_mode: bool = Tru
         for e in errors:
             print(f"  {e['id']}: {e['status']}")
 
-    # RunPod eğitim komutunu göster
-    print("Eğitimi başlatmak için RunPod'da çalıştırın:")
+    # RunPod/Colab eğitim komutunu göster
+    print("Eğitimi başlatmak için Colab/RunPod'da çalıştırın:")
     print(f"  nnUNetv2_plan_and_preprocess -d {dataset_id:03d} --verify_dataset_integrity")
     print(f"  nnUNetv2_train {dataset_id:03d} 3d_fullres 0")
     print()
@@ -403,24 +467,21 @@ def process_all_patients(dicom_root: str, output_dir: str, fast_mode: bool = Tru
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="YazOkuluDetect — Otomatik Eğitim Verisi Hazırlama",
+        description="YazOkuluDetect — Otomatik Multi-Organ Abdominal Eğitim Verisi Hazırlama",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Örnekler:
   # Tek hasta test:
   python prepare_training_data.py --dicom_root ./test_dicom --output_dir ./test_output
 
-  # Tüm hastalar:
+  # Tüm hastalar (Multi-Organ Abdominal Cavity):
   python prepare_training_data.py --dicom_root D:/hastalar --output_dir D:/egitim_verisi
-
-  # Tam kalite maske (yavaş):
-  python prepare_training_data.py --dicom_root D:/hastalar --output_dir D:/egitim_verisi --full_quality
         """
     )
     parser.add_argument("--dicom_root",   required=True,       help="DICOM klasörlerinin ana dizini")
     parser.add_argument("--output_dir",   required=True,       help="Çıktı dizini")
     parser.add_argument("--dataset_id",   type=int, default=1, help="nnU-Net dataset ID (varsayılan: 1)")
-    parser.add_argument("--dataset_name", default="LiverLesion", help="Dataset adı (varsayılan: LiverLesion)")
+    parser.add_argument("--dataset_name", default="AbdominalTumor", help="Dataset adı (varsayılan: AbdominalTumor)")
     parser.add_argument("--full_quality", action="store_true", help="TotalSegmentator tam kalite (yavaş)")
 
     args = parser.parse_args()
@@ -432,3 +493,4 @@ if __name__ == "__main__":
         dataset_id=args.dataset_id,
         dataset_name=args.dataset_name,
     )
+

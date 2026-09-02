@@ -147,7 +147,8 @@ Eğitime geçmeden önce backend ve arayüzün çalıştığını doğrulayın:
 | Modül Dosyası | Temel İşlevi | Çıktı / Etki |
 |---------------|--------------|--------------|
 | `preprocess.py` | DICOM → NIfTI, HU Windowing, Resampling | `baseline.nii.gz`, `raw_hu_baseline.nii.gz` |
-| `prepare_nnunet_data.py` | Scalable dataset converter | `Dataset001_LiverLesion/`, `dataset.json`, `run_cloud_training.sh` |
+| `prepare_nnunet_data.py` | Scalable dataset converter | `Dataset001_AbdominalTumor/`, `dataset.json`, `run_cloud_training.sh` |
+| `prepare_training_data.py` | Otomatik Batın Veri Hazırlama & Pseudo-Labeling | `01_nifti/`, `02_ts_masks/`, `03_merged_labels/` |
 | `inference.py` | nnU-Net v2 / Safe Mock inference | `baseline_mask.nii.gz`, 3D Hacim & Çap |
 | `radiomics_module.py` | Şekil, doku, HU sınıflandırma | Malign/Benign/Vasküler + Confidence + `needs_review` |
 | `matching_engine.py` | Registration + Hungarian Algorithm | Rigid+B-Spline NIfTI, Eşleşen Lezyonlar, Otomatik SOD |

@@ -1,426 +1,100 @@
-# Yapay Zeka Destekli Onkolojik BT Analizi — Uçtan Uca RECIST 1.1 Karar Destek Sistemi
+# HepaRECIST-AI: 4D Longitudinal Abdominal Tümör Takibi ve Otomatik RECIST 1.1 Tedavi Yanıtı Değerlendirme Platformu
 
-> **Son Güncelleme:** 18 Ağustos 2026  
-> **Kapsam:** Etiketlenmemiş Sectra PACS DICOM çiftleri → Longitudinal RECIST 1.1 Kararı  
-> **Hedef Organ:** Üst Batın (Abdomen-Üst), Kontrastlı BT, 0.625 mm ince kesit
-
----
-
-## 📝 17 Ağustos 2026 Oturum Notları
-
-### Arayüz Yeniden Tasarımı (Tamamlandı ✅)
-- Eski arayüzde 3 ayrı buton ve manuel SOD girişi vardı — doktor kullanıma uygun değildi.
-- Yeni arayüz: **"Tek Tetkik"** ve **"Longitudinal (t0+t1)"** mod seçici sekme.
-- t0 ve t1 yüklenince **PatientID otomatik karşılaştırılıyor** → aynı hastaysa ✅, farklıysa ⚠️ uyarısı.
-- Tek "Analizi Başlat" butonu → `/pipeline` veya `/pipeline-single` otomatik çağrılıyor.
-- Manuel SOD girişi kaldırıldı — değerler pipeline JSON'dan otomatik geliyor.
-- Değişiklikler GitHub'a push edildi: `feat(ui): longitudinal mode ve pipeline entegrasyonu`
-
-### B-Spline Registration Hızlandırma (Geçici ⚠️)
-- Test ortamında B-Spline registration çok uzun sürdüğü için parametreler hızlandırıldı.
-- Grid spacing: 50mm → **80mm**, iterasyon: 100 → **50**, maxEval: 1000 → **300**
-- **Eğitim sonrası klinik moda alınması gerekiyor** (Bkz. "Eğitim Sonrası Yapılacaklar" bölümü)
-
-### Etiketleme (Pseudo-labeling) Stratejisi
-**Sistemin eğitim için neye ihtiyacı var:**
-- Her hasta için: `hasta_XXX.nii.gz` (BT) + `hasta_XXX_mask.nii.gz` (lezyon maskesi)
-- Maske elle çizilmiyor — **TotalSegmentator** otomatik üretiyor, hoca 3D Slicer'da onaylıyor.
-
-**İş bölümü:**
-| Adım | Kim Yapıyor | Süre |
-|---|---|---|
-| DICOM → NIfTI | Sen (`preprocess.py`) | Otomatik |
-| Taslak maske üretimi | TotalSegmentator (otomatik) | ~2-3 saat |
-| Maske onaylama | **Hoca (3D Slicer'da)** | ~10 dk/hasta |
-| nnU-Net formatı | Sen (`prepare_nnunet_data.py`) | Otomatik |
-| Training | RunPod GPU | ~12-24 saat |
-
-**Doktor müsait değilse:** TotalSegmentator maskelerini onaysız kullanarak direkt eğitime başlanabilir.
-- Avantaj: Proje bloke olmaz, pipeline test edilir
-- Dezavantaj: Küçük lezyonlar (<10mm) kaçırılabilir, Dice skoru düşük çıkar
-- Öneri: İlk iterasyonu onaysız yap, hoca zamanı olunca 5-10 vakayı onaylayıp fine-tune et
-
-### Veri Boyutu Problemi
-- Ham DICOM verisi ~256GB → lokal bilgisayara yüklenemez
-- Çözüm: Hoca bilgisayarında DICOM → NIfTI dönüşümü yapılır (~50-80GB'a düşer)
-- NIfTI verisi **RunPod** veya **üniversite HPC**'ye yüklenir, training orada yapılır
-- Eğitim bittikten sonra sadece `checkpoint_final.pth` (~200-500MB) indirilir
-
-### Doğruluk Metrikleri
-- **Segmentasyon doğruluğu:** Dice Skoru (0.0-1.0, >0.85 hedef)
-- **RECIST ölçüm doğruluğu:** ICC katsayısı (sistem vs. radyolog çap ölçümü)
-- **Klinik karar doğruluğu:** Cohen's Kappa (PD/PR/SD/CR kararı uyumu)
-- Şu an model eğitilmemiş → Dice = N/A. Eğitim sonrası nnU-Net otomatik hesaplar.
-
-### Raporların Değeri
-- REPORTS klasöründeki radyoloji raporları formal RECIST değil, genel radyoloji raporu.
-- İçinde ölçüm değerleri var (örn. "%33 küçülmüş, 10mm LAP") ama PD/PR/SD/CR yok.
-- Sistem bu ölçümleri alıp **formal RECIST 1.1 kararı üretiyor** — hocanın yapmadığı formalizasyon budur.
-
-### Yarınki Toplantı İçin Sorular
-1. Kaç hasta çifti (t0+t1) var?
-2. Önceden çizilmiş segmentasyon maskesi var mı?
-3. GPU erişimi: RunPod mu, üniversite HPC mi?
-4. Hoca 3D Slicer onay sürecine dahil olabilir mi?
+> **Durum:** Aktif Geliştirme & Model Eğitimi Aşaması  
+> **Kapsam:** 55 Hasta / 106 BT Serisi (Sectra PACS DICOM) → Çok Zamanlı Abdominal Takip & RECIST 1.1 Kararı  
+> **Hedef Bölge:** Tüm Batın (Abdominal Cavity: Karaciğer, Dalak, Böbrekler, Pankreas, Mide, Aorta, Lezyonlar)
 
 ---
 
-
-## Genel Bakış
-
-İki aşamalı AI pipeline kullanan karar destek sistemi. nnU-Net tabanlı yüksek hassasiyetli segmentasyon; Radiomics/CNN tabanlı sınıflandırma; radyolog onay katmanı ve tamamen kural tabanlı RECIST 1.1 motoru. Elinizde **etiketlenmemiş Sectra PACS çıktısı (DICOM)** ve her hasta için **iki farklı tarihli çekim (Bazal + Kontrol)** bulunmaktadır.
-
----
-
-## Veri Seti Durumu
-
-| Özellik | Değer |
-|---|---|
-| **Format** | Sectra PACS CD/USB Export (DICOM) |
-| **Yapı** | COMMON / DICOM / RA32 / RA64 / REPORTS / SECTRA klasörleri |
-| **Kesit Kalınlığı** | 0.625 mm (THX) — Yüksek Z-çözünürlük |
-| **Çekim Tipi** | Abdomen Üst — Kontrastlı BT |
-| **Tarihler** | Her hasta için 2 çekim (Bazal + Kontrol) |
-| **Etiket Durumu** | ❌ Etiketlenmemiş — Pseudo-labeling stratejisi uygulanacak |
-
----
-
-## Danışman Onaylı Pipeline
+## 🏗️ 1. Sistem Mimarisi ve 5 Fazlı Boru Hattı
 
 ```
-CT Görüntüsü (DICOM — Sectra Export)
-        │
-        ▼
-[1] DICOM → NIfTI Dönüştürücü  ← Python otomasyonu
-    ├─ Sectra klasör yapısı tarama (DICOMDIR indeksi)
-    ├─ Aksiyal + ince kesit serisi otomatik seçimi (≤1mm, >100 kesit)
-    ├─ patient_01_baseline.nii.gz / patient_01_followup.nii.gz
-    └─ HU Windowing (WL:50 WW:350 — Soft Tissue)
-        │
-        ▼
-[2] Pseudo-Labeling (Yarı Otomatik Etiketleme)  ← SÜREÇ HIZLANDIRICI
-    ├─ TotalSegmentator ile organ sınırları (Karaciğer, Dalak, Böbrek)
-    ├─ LiTS/MSD Task03 pre-trained nnU-Net ile lezyon taslak maskesi
-    └─ 3D Slicer'da radyolog hızlı onay/düzeltme (sıfırdan çizim YOK)
-        │
-        ▼
-[3] 3D nnU-Net Segmentasyon  ← Yüksek sensitivity, düşük eşik
-    └─ TÜM şüpheli bölgeleri tespit eder (kaçırma riskini minimize et)
-        │
-        ▼
-[4] Radiomics / CNN Sınıflandırma
-    ├─ Malign / Benign / Vasküler sınıflandırma
-    ├─ PyRadiomics: texture, shape, HU histogram özellikleri
-    ├─ Güven skoru (confidence) üretimi
-    └─ Düşük güvenli bölgeler → Radyolog onay kuyruğu
-        │
-        ▼
-[5] Radyolog Onay Adımı  ← Klinik güvenlik katmanı
-    ├─ AI önerilerini güven skoru ile listeler
-    ├─ Radyolog: onayla / reddet / düzenle
-    └─ Onaylanan lezyonlar RECIST pipeline'a girer
-        │
-        ▼
-[6] ANTsPy SyN Registration
-    ├─ Bazal BT ↔ Kontrol BT Deformable (non-rigid) hizalama
-    └─ Asenkron işlem (Celery + Redis) — UI bloklanmaz
-        │
-        ▼
-[7] Hibrit Lezyon Eşleştirme  ← Projenin Özgün Katkısı
-    ├─ Centroid 3D Öklid Mesafesi + IoU + Boyut Benzerliği
-    ├─ Hungarian Algorithm (optimal global eşleştirme)
-    └─ Yeni / Kaybolan lezyon tespiti
-        │
-        ▼
-[8] RECIST 1.1 Uyumlu Ölçüm
-    ├─ Hedef Lezyon Seçimi (maks 5 toplam, organ başına maks 2)
-    ├─ 2D Feret Çapı (aksiyal dilim bazlı maksimum — 3D diyagonal DEĞİL)
-    ├─ Lenf nodu: short-axis (≥15mm) | Organ: long-axis (≥10mm)
-    └─ SOD (Sum of Diameters) hesabı
-        │
-        ▼
-[9] Rule Engine — Açıklanabilir Karar  ← Tamamen kural tabanlı, LLM'siz
-    └─ CR / PR / SD / PD kararı
-        │
-        ▼
-[10] LLM Destekli Klinik Rapor  ← Karar değil, dil çevirisi
-     └─ Doğrulanmış sayısal veriler → Türkçe + İngilizce radyoloji raporu
+[DICOM Serileri (t0, t1)] 
+         │
+         ▼
+[Faz 1: Ön İşleme (preprocess.py)]
+    • 106 Serilik PACS DICOM taraması (400-850 kesitlik aksiyel hacimler)
+    • Çok katmanlı DICOM → 3D NIfTI dönüşümü (dicom2nifti + pydicom fallback)
+    • Soft-Tissue HU Windowing (WL:40, WW:150) ve 1.0 mm³ izotropik B-Spline Resampling
+         │
+         ▼
+[Faz 2: 3D Multi-Organ Segmentasyon (prepare_training_data.py & inference.py)]
+    • TotalSegmentator ile otomatik 8-sınıflı batın maskeleme (Pseudo-Labeling):
+      0: Arka Plan, 1: Karaciğer, 2: Dalak, 3: Böbrekler, 4: Pankreas, 5: Safra Kesesi, 6: Mide, 7: Aorta, 8: Lezyonlar
+    • Dataset001_AbdominalTumor olarak nnU-Net v2 formatında veri seti hazırlığı
+    • 3D Full-Resolution nnU-Net v2 derin öğrenme eğitimi (Google Colab / RunPod GPU)
+         │
+         ▼
+[Faz 3: Radyomik Doğrulama (radiomics_module.py)]
+    • HU yoğunluk istatistikleri ve 3D Küresellik (Sphericity Ψ) analizi
+    • Basit kistlerin (0-20 HU, yüksek küresellik) ve damarların (≥120 HU) elenmesi
+    • Güven Skoru üretimi (<0.75 olanlar için hekim onay bayrağı)
+         │
+         ▼
+[Faz 4: 4D Longitudinal Registration & Eşleştirme (matching_engine.py)]
+    • İki aşamalı SimpleITK hizalama: Rigid (Euler3D) + Deformable B-Spline Registration
+    • Bipartite hibrit maliyet matrisi üzerinden Macar (Hungarian) Algoritması ile lezyon eşleştirme
+    • Bireysel lezyon çap değişimleri (Δ%) ve Yeni Lezyon (New Lesion) tespiti
+         │
+         ▼
+[Faz 5: Deterministik RECIST 1.1 Karar Motoru & Raporlama (main.py & YazOkuluDetectUI)]
+    • Çapların Toplamı (SOD) ve Nadir takibi
+    • Matematiksel kurallarla CR / PR / SD / PD sınıflandırması
+    • C# .NET 9.0 WPF Masaüstü Arayüzü & Düzce Üniversitesi Formatında Otomatik PDF/JSON Klinik Rapor
 ```
 
 ---
 
-## Dört Bilimsel Katkı (Tez Eksenleri)
+## 📊 2. Veri Seti ve Etiketleme Yapısı
 
-| # | Katkı | Açıklama | Düzey |
-|---|-------|----------|-------|
-| 1 | **Otomatik 3D Lezyon Segmentasyonu** | nnU-Net, pseudo-label destekli eğitim, yüksek sensitivity | Teknik uygulama |
-| 2 | **Komşu Patoloji Ayrımı** ⭐ | Radiomics + CNN ile malign/benign/vasküler sınıflandırma + güven skoru | **Yeni katkı** |
-| 3 | **Longitudinal Lezyon Eşleştirme** ⭐⭐ | Hibrit matching (centroid + IoU + boyut) + yeni/kaybolan lezyon tespiti | **En özgün katkı** |
-| 4 | **Açıklanabilir Karar + Otomatik Raporlama** | Rule-based motor + LLM raporlayıcı | Klinik uygulama |
+* **Kaynak:** Düzce Üniversitesi Tıp Fakültesi Araştırma Hastanesi Onkoloji Polikliniği (55 Hasta, 106 CT Serisi)
+* **Primer Tanılar:** Kolon CA, Mide CA, Meme CA, Rektum CA, Pankreas CA, Akciğer CA
+* **nnU-Net v2 Etiket Şeması (`dataset.json`):**
 
-> [!IMPORTANT]
-> **Katkı #3** (Longitudinal Eşleştirme) projenin bilimsel özgünlüğünü taşır.  
-> **Katkı #2** hocanın "komşu patolojiden ayırt edebilir mi?" sorusuna doğrudan yanıt verir.  
-> Bu ikili kombinasyon çalışmayı literatürdeki salt segmentasyon çalışmalarından belirgin biçimde ayırır.
-
----
-
-## Teknik Mimari
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                  C# WPF / MAUI Arayüzü                  │
-│  ┌──────────────┐  ┌──────────────┐  ┌───────────────┐  │
-│  │ DICOM Viewer │  │ Radyolog     │  │ RECIST        │  │
-│  │ (FellowOak)  │  │ Onay Paneli  │  │ Rapor Görünüm │  │
-│  └──────────────┘  └──────────────┘  └───────────────┘  │
-└─────────────────────────────┬───────────────────────────┘
-                              │ HTTP/REST (async polling)
-┌─────────────────────────────▼───────────────────────────┐
-│                   FastAPI Python Backend                  │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │  Celery + Redis  (Asenkron Görev Kuyruğu)        │   │
-│  │  ├─ ANTsPy SyN Registration (uzun süre)          │   │
-│  │  └─ nnU-Net Inference (GPU)                      │   │
-│  └──────────────────────────────────────────────────┘   │
-│  ┌─────────────────────┐  ┌──────────────────────────┐  │
-│  │  DICOM→NIfTI Parser │  │  PyRadiomics             │  │
-│  │  Seri Seçici        │  │  ML Sınıflandırıcı       │  │
-│  └─────────────────────┘  └──────────────────────────┘  │
-│  ┌──────────────────┐  ┌──────────────────────────────┐  │
-│  │  RECIST 1.1      │  │    LLM Rapor Modülü          │  │
-│  │  Rule Engine     │  │  (sadece dil dönüşümü)       │  │
-│  │  CR/PR/SD/PD     │  │  Gemini / GPT-4o / Lokal LLM│  │
-│  └──────────────────┘  └──────────────────────────────┘  │
-└─────────────────────────────────────────────────────────┘
-```
+| Etiket No | Anatomik Doku / Yapı | Açıklama |
+|:---:|:---|:---|
+| **0** | `background` | Arka plan, kemik, hava ve diğer dokular |
+| **1** | `liver` | Karaciğer parankim dokusu |
+| **2** | `spleen` | Dalak dokusu |
+| **3** | `kidneys` | Sağ ve sol böbrekler |
+| **4** | `pancreas` | Pankreatik organ dokusu |
+| **5** | `gallbladder` | Safra kesesi |
+| **6** | `stomach` | Mide lümen/duvarı |
+| **7** | `aorta` | Abdominal ana aort damarı |
+| **8** | `lesion` | Solid tümör ve metastaz odakları |
 
 ---
 
-## Kritik Teknik Detaylar
+## 🛠️ 3. Modül Haritası ve Dosya Sorumlulukları
 
-### DICOM Seri Seçici
-```python
-def select_target_series(study_dir: str) -> str:
-    """
-    Sectra DICOMDIR üzerinden aksiyal + ince kesit serisi otomatik seçimi.
-    """
-    for series in read_dicomdir(study_dir):
-        if (series.slice_thickness <= 1.0
-                and "AXIAL" in series.image_type
-                and series.slice_count > 100):
-            return series
-```
-
-### 2D RECIST Çap Ölçümü (Aksiyal Dilim Bazlı)
-```python
-def measure_recist_diameter(mask_3d: np.ndarray) -> float:
-    """
-    3D maskeyi aksiyal (Z) dilim dilim tara,
-    her dilimdeki max 2D Feret çapını bul.
-    RECIST 1.1: 3D diyagonal çap KULLANILMAZ.
-    """
-    max_diameter = 0.0
-    for z in range(mask_3d.shape[2]):
-        slice_2d = mask_3d[:, :, z]
-        if slice_2d.any():
-            diameter = feret_diameter_max(slice_2d)
-            max_diameter = max(max_diameter, diameter)
-    return max_diameter
-```
-
-### Hedef Lezyon Seçici (RECIST 1.1 Kısıtları)
-```python
-def select_target_lesions(lesions: list) -> list:
-    """
-    RECIST 1.1: Toplam maks 5 lezyon, organ başına maks 2.
-    Organ lezyonu: long-axis ≥10mm
-    Lenf nodu: short-axis ≥15mm
-    """
-    organ_counts = defaultdict(int)
-    targets = []
-    for lesion in sorted(lesions, key=lambda l: l.diameter, reverse=True):
-        if organ_counts[lesion.organ] < 2 and len(targets) < 5:
-            if lesion.is_lymph_node and lesion.short_axis >= 15:
-                targets.append(lesion)
-                organ_counts[lesion.organ] += 1
-            elif not lesion.is_lymph_node and lesion.long_axis >= 10:
-                targets.append(lesion)
-                organ_counts[lesion.organ] += 1
-    return targets
-```
-
-### RECIST 1.1 Karar Motoru
-```python
-def recist_decision_engine(sod_baseline: float,
-                            sod_followup: float,
-                            new_lesion: bool) -> str:
-    """
-    Tamamen deterministik, LLM bağımsız karar motoru.
-    Kaynak: Eisenhauer et al., 2009, Eur J Cancer
-    """
-    change_pct = (sod_followup - sod_baseline) / sod_baseline * 100
-
-    if new_lesion or (change_pct >= 20 and (sod_followup - sod_baseline) >= 5):
-        return "PD"   # Progressive Disease
-    if sod_followup == 0:
-        return "CR"   # Complete Response
-    if change_pct <= -30:
-        return "PR"   # Partial Response
-    return "SD"       # Stable Disease
-```
-
-### LLM Rapor Modülü (Doğru Kullanım)
-```python
-# ✅ DOĞRU: LLM'e sadece doğrulanmış sayılar ve kesinleşmiş karar gönderilir
-prompt = f"""
-Sen bir radyoloji rapor yazarısın.
-Aşağıdaki DOĞRULANMIŞ klinik verileri standart radyoloji raporu diline çevir.
-Karar değiştirme, yorum ekleme.
-
-Bazal SOD  : {sod_baseline:.1f} mm
-Kontrol SOD: {sod_followup:.1f} mm
-Değişim    : {change_pct:.1f}%
-Yeni Lezyon: {"Var" if new_lesion else "Yok"}
-RECIST Kararı: {recist_decision}   ← Bu değiştirilemez
-
-Raporu Türkçe ve İngilizce olarak yaz.
-"""
-
-# ❌ YANLIŞ: LLM'e ham görüntü gönderip karar isteme
-```
+| Modül Dosyası | Temel Sorumluluk | Çıktı / Etki |
+|:---|:---|:---|
+| `preprocess.py` | DICOM → 3D NIfTI, HU Windowing, 1mm³ B-Spline Resampling | `baseline.nii.gz`, `raw_hu_baseline.nii.gz` |
+| `prepare_training_data.py` | 106 seriyi tarayıp TotalSegmentator ile 8-sınıflı batın maskeleri üretir | `01_nifti/`, `02_ts_masks/`, `03_merged_labels/` |
+| `prepare_nnunet_data.py` | nnU-Net v2 dizin yapısını ve `dataset.json` dosyasını oluşturur | `nnUNet_raw/Dataset001_AbdominalTumor/` |
+| `inference.py` | nnU-Net v2 model çıkarımı yapar (Model yoksa güvenli Mock modu) | 3D lezyon maskeleri ve Feret çapları |
+| `radiomics_module.py` | Doku yoğunluğu, küresellik ve güven skoru hesaplar | Malign/Benign ayrımı ve `needs_review` bayrağı |
+| `matching_engine.py` | B-Spline Registration + Hungarian Algorithm ile lezyon takibi | Eşleşen lezyonlar, Δ% çaplar, otomatik SOD |
+| `report_generator.py` | Düzce Üniversitesi resmi hastane şablonunda radyoloji raporu üretir | Türkçe + İngilizce Standart Rapor (.txt / .pdf) |
+| `pipeline.py` | Tüm 5 adımı tek komutla orkestre eden ana boru hattı | `run_full_pipeline()` sonuç dict'i |
+| `main.py` | FastAPI asenkron REST API sunucusu (10 endpoint) | C# WPF masaüstü uygulamasıyla haberleşme |
+| `YazOkuluDetectUI/` | C# .NET 9.0 WPF Masaüstü İstemcisi | Çift 3D kesit görüntüleyici, DICOM meta, RECIST rozetleri |
 
 ---
 
-## Geliştirme Fazları
+## 🚀 4. Uygulama ve Çalıştırma Adımları
 
-### Faz 1 — Altyapı & Veri Hazırlığı (4–6 hafta)
-- [ ] Sectra DICOM klasör tarayıcı + seri seçici scripti
-- [ ] DICOM → NIfTI dönüştürücü (`dicom2nifti` + HU windowing)
-- [ ] `patient_XX_baseline.nii.gz` / `patient_XX_followup.nii.gz` klasör yapısı
-- [ ] TotalSegmentator ile organ sınırı pseudo-labeling
-- [ ] LiTS / MSD Task03 pre-trained nnU-Net ile lezyon taslak maskesi üretimi
-- [ ] 3D Slicer'da radyolog hızlı maske onayı (sıfırdan çizim YOK)
-- [ ] FastAPI iskelet projesi kurulumu
-- [ ] Celery + Redis asenkron görev altyapısı
-- [ ] C# WPF prototip (DICOM viewer + radyolog onay paneli)
-
-### Faz 2 — Segmentasyon Modeli Eğitimi (6–8 hafta)
-- [ ] nnU-Net veri hazırlığı (`imagesTr/labelsTr` klasör yapısı)
-- [ ] RunPod / Vast.ai ortam kurulumu (RTX 4090)
-- [ ] nnU-Net fingerprint + plan oluşturma (düşük eşik konfigürasyonu)
-- [ ] 5-fold cross-validation eğitimi
-- [ ] Dice skoru değerlendirme (hedef: >0.85)
-- [ ] Model weights lokal inference için dışa aktarım
-
-### Faz 3 — Radiomics Sınıflandırma Modülü (3–4 hafta) ⭐
-- [ ] PyRadiomics entegrasyonu (texture, shape, HU histogram özellikleri)
-- [ ] Malign / Benign / Vasküler etiketli eğitim seti hazırlama
-- [ ] Random Forest / XGBoost sınıflandırıcı eğitimi
-- [ ] Güven skoru (confidence) sistemi
-- [ ] Düşük güvenli bölge → radyolog onay kuyruğu mekanizması
-- [ ] **Ablation study:** Sadece nnU-Net vs nnU-Net + Radiomics (FP oranı karşılaştırması)
-
-### Faz 4 — Longitudinal Analiz Motoru (4–6 hafta) ⭐⭐
-- [ ] ANTsPy SyN deformable registration (Celery async olarak)
-- [ ] Hibrit lezyon eşleştirme algoritması (centroid + IoU + boyut)
-- [ ] Hungarian algorithm entegrasyonu
-- [ ] Yeni / kaybolan lezyon tespiti
-- [ ] 2D Feret çapı (aksiyal dilim bazlı) + SOD hesaplama
-- [ ] RECIST 1.1 hedef lezyon seçici (maks 5, organ başına maks 2)
-
-### Faz 5 — Karar Motoru & Raporlama (3–4 hafta)
-- [ ] RECIST 1.1 rule engine (tamamen kural tabanlı, LLM'siz)
-- [ ] LLM rapor modülü (Gemini / GPT-4o / Lokal LLM entegrasyonu)
-- [ ] PDF rapor üretimi (Türkçe + İngilizce)
-- [ ] C# UI → FastAPI tam entegrasyon (async polling + radyolog onay akışı)
-
-### Faz 6 — Doğrulama & Yayın Hazırlığı (4 hafta)
-- [ ] Radyolog pilot değerlendirmesi
-- [ ] İstatistiksel analiz (ICC, kappa katsayısı, sensitivity/specificity)
-- [ ] Ablation study sonuçlarının raporlanması
-- [ ] Makale taslağı hazırlama
-
----
-
-## Açık Kararlar (Yanıtlanması Gereken)
-
-> [!WARNING]
-> Aşağıdaki kararlar teknik implementasyonu doğrudan etkiler.
-
-| # | Soru | Seçenekler |
-|---|------|-----------|
-| 1 | **LLM tercihi?** | Gemini API (ücretsiz tier) / GPT-4o (ücretli) / Lokal LLaMA 3 (gizlilik) |
-| 2 | **UI framework?** | WPF (.NET — olgun) / MAUI (.NET 8 — cross-platform) / ASP.NET Core (web) |
-| 3 | **Eğitim ortamı?** | RunPod RTX 4090 (kiralık) / Lokal GPU (varsa) / Google Colab Pro |
-
----
-
-## Yayın Potansiyeli
-
-| Dergi | Seviye | Uygun Katkı |
-|-------|--------|-------------|
-| Medical Image Analysis | Q1 | Hibrit lezyon eşleştirme |
-| European Journal of Radiology | Q2 | RECIST otomasyon sistemi |
-| Computers in Biology and Medicine | Q2 | Ablation study + radyomik sınıflandırma |
-
-> [!TIP]
-> **Ablation study** (hibrit matching vs. naive centroid-only vs. IoU-only karşılaştırması) yayın özgünlüğünü güçlü şekilde kanıtlar ve tek başına makaleye değer bir bulgu üretir.
-
----
-
-## ✅ Eğitim Sonrası Yapılacaklar Listesi
-
-> [!IMPORTANT]
-> Model eğitimi tamamlanıp `./models/checkpoint_final.pth` dosyası yerleştirildikten sonra aşağıdaki adımlar **sırayla** uygulanmalıdır.
-
-### 1. Model Ağırlığını Yerleştir
-```
-c:\Projects\YazOkuluDetect\models\checkpoint_final.pth
-```
-Başka hiçbir kod değişikliği gerekmez — sistem otomatik olarak gerçek AI moduna geçer.
-Arayüzdeki rozet: **"🔧 Test Modu"** → **"🧠 Gerçek AI Modu (nnU-Net)"** olarak güncellenir.
-
----
-
-### 2. B-Spline Registration Parametrelerini Klinik Moda Al
-
-> [!WARNING]
-> **Bu adım kritiktir.** Şu an B-Spline registration parametreleri test/geliştirme ortamı için hızlandırılmış değerlere ayarlıdır.
-> Klinik kullanım öncesinde [`matching_engine.py`](file:///c:/Projects/YazOkuluDetect/matching_engine.py) dosyasında şu değişikliği yapın:
-
-**Dosya:** [`matching_engine.py`](file:///c:/Projects/YazOkuluDetect/matching_engine.py) — yaklaşık satır 77-104
-
-```python
-# ❌ MEVCUT (Test/Hızlı mod — eğitim sonrası bunu DEĞİŞTİRİN):
-grid_physical_spacing = [80.0, 80.0, 80.0]   # kaba grid
-numberOfIterations    = 50                     # az iterasyon
-maximumNumberOfFunctionEvaluations = 300       # az değerlendirme
-shrinkFactors = [2]                            # tek piramit seviyesi
-
-# ✅ KLİNİK MOD (eğitim sonrası buna GEÇİN):
-grid_physical_spacing = [50.0, 50.0, 50.0]   # hassas grid
-numberOfIterations    = 100                    # yeterli iterasyon
-maximumNumberOfFunctionEvaluations = 1000      # tam değerlendirme
-shrinkFactors = [2, 1]                         # iki piramit seviyesi
-```
-
-**Neden önemli:** 50mm grid spacing, organ kayması düzeltmede ~2-3mm daha hassas registration sağlar. Hatalı registration → yanlış lezyon eşleştirme → yanlış SOD → yanlış RECIST kararı zincirini önler.
-
----
-
-### 3. Sistem Doğrulama Testleri
-- [ ] En az 5 hasta çiftiyle (t0 + t1) end-to-end pipeline testi
-- [ ] RECIST kararlarını radyolog referans kararlarıyla karşılaştır
-- [ ] Registration kalitesini görsel olarak doğrula (hizalanmış görüntüleri kontrol et)
-- [ ] Lezyon eşleştirme oranını hesapla (yanlış eşleşme var mı?)
-
----
-
-### 4. Opsiyonel: LLM Rapor Modunu Aktif Et
-`main.py` — `/pipeline` endpoint çağrısında:
-```json
-{ "use_llm": true, "llm_api_key": "YOUR_GEMINI_API_KEY" }
-```
-LLM **karar vermez** — sadece doğrulanmış RECIST metriklerini klinik rapor diline çevirir.
-
+1. **Google Colab'da Otomatik Veri Hazırlama:**
+   ```python
+   %cd /content/YazOkuluDetect
+   !git pull origin main
+   !python prepare_training_data.py --dicom_root "/content/drive/MyDrive/hasta dosya" --output_dir "/content/drive/MyDrive/Egitim_Verisi_Hazir"
+   ```
+2. **nnU-Net v2 Model Eğitimi:**
+   ```bash
+   nnUNetv2_plan_and_preprocess -d 001 --verify_dataset_integrity
+   nnUNetv2_train 001 3d_fullres 0
+   ```
+3. **Lokal Sunucu ve Masaüstü GUI Çalıştırma:**
+   * Backend: `uvicorn main:app --reload`
+   * Frontend: `dotnet run --project YazOkuluDetectUI\YazOkuluDetectUI.csproj`
