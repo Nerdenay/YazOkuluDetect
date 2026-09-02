@@ -135,9 +135,7 @@ def find_dicom_series(root_dir: str) -> list:
 
 def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True) -> bool:
     """
-    TotalSegmentator'ı tek iş parçacıklı (single-thread) ve doğrudan Python API ile çalıştırır.
-    nr_threads_resampling=1 ve nr_threads_saving=1 parametreleri Colab'da sahte ^C (SIGINT)
-    ve multiprocessing sinyal kilitlenmelerini %100 engeller.
+    TotalSegmentator'ı doğrudan Python API üzerinden (in-process) çalıştırır.
     """
     Path(ts_output_dir).mkdir(parents=True, exist_ok=True)
     liver_file = Path(ts_output_dir) / "liver.nii.gz"
@@ -148,7 +146,7 @@ def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True)
 
     print(f"    [TotalSegmentator] Karaciğer segmentasyonu başlatılıyor...")
     
-    # 1. Doğrudan Python API ile tek iş parçacığında çalıştır (en kararlı yöntem)
+    # 1. Doğrudan Python API ile çalıştır (en kararlı yöntem)
     try:
         from totalsegmentator.python_api import totalsegmentator
         import nibabel as nib
@@ -161,9 +159,7 @@ def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True)
             fast=fast,
             roi_subset=["liver"],
             quiet=True,
-            verbose=False,
-            nr_threads_resampling=1,
-            nr_threads_saving=1
+            verbose=False
         )
         
         if liver_file.exists():
@@ -179,7 +175,7 @@ def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True)
     # 2. Fallback: CLI
     try:
         ts_bin = shutil.which("TotalSegmentator") or "TotalSegmentator"
-        cmd = [ts_bin, "-i", nifti_path, "-o", ts_output_dir, "--roi_subset", "liver", "--nr_threads_saving", "1"]
+        cmd = [ts_bin, "-i", nifti_path, "-o", ts_output_dir, "--roi_subset", "liver"]
         if fast:
             cmd.append("--fast")
         
@@ -319,24 +315,24 @@ def process_all_patients(dicom_root: str, output_dir: str, fast_mode: bool = Tru
             stats = merge_organ_labels(ts_out_dir, merged_label_path)
             print(f"    [3/3] ✅ Etiket birleştirme OK")
         else:
-            # TotalSegmentator başarısız → boş maske (karaciğer de yok)
-            import nibabel as nib, numpy as np
-            ref = nib.load(nifti_out)
-            nib.save(nib.Nifti1Image(np.zeros(ref.shape, dtype="uint8"), ref.affine), merged_label_path)
             stats = {"liver_voxels": 0, "lesion_voxels": 0, "has_lesion": False}
-            print(f"    [3/3] ⚠️  Boş maske üretildi (TotalSegmentator başarısız)")
-
+            print(f"    [3/3] ❌ Segmentasyon başarısız olduğu için etiket üretilemedi.")
         # 4. nnU-Net v2 formatına kopyala ────────────────────────────────────
         # imagesTr: hasta_001_0000.nii.gz (BT kanalı)
         # labelsTr: hasta_001.nii.gz      (maske)
-        try:
-            shutil.copy2(nifti_out, str(Path(images_tr) / f"{patient_id}_0000.nii.gz"))
-            shutil.copy2(merged_label_path, str(Path(labels_tr) / f"{patient_id}.nii.gz"))
-        except Exception as copy_err:
-            print(f"    [4/4] ❌ nnU-Net kopyalama hatası: {copy_err}")
-            results.append({"id": patient_id, "status": "HATA", "adim": "Kopyalama"})
-            print()
-            continue
+        if ts_ok and stats["liver_voxels"] > 0:
+            try:
+                shutil.copy2(nifti_out, str(Path(images_tr) / f"{patient_id}_0000.nii.gz"))
+                shutil.copy2(merged_label_path, str(Path(labels_tr) / f"{patient_id}.nii.gz"))
+                print(f"    [4/4] ✅ nnU-Net klasörüne aktarıldı.")
+            except Exception as copy_err:
+                print(f"    [4/4] ❌ nnU-Net kopyalama hatası: {copy_err}")
+                results.append({"id": patient_id, "status": "HATA", "adim": "Kopyalama"})
+                print()
+                continue
+        else:
+            print(f"    [4/4] ⚠️  Segmentasyon başarısız olduğu için nnU-Net klasörüne kopyalanmadı.")
+
 
         # Karaciğer voxel sayısı çok düşükse uyar (yanlış seri veya boş maske)
         if stats["liver_voxels"] < 1000:
