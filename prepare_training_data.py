@@ -142,6 +142,8 @@ def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True)
     ts_bin = shutil.which("TotalSegmentator")
     cmd = [ts_bin if ts_bin else sys.executable, "-m", "totalsegmentator.bin.TotalSegmentator"] if not ts_bin else [ts_bin]
     cmd += ["-i", nifti_path, "-o", ts_output_dir] + roi_args
+    # Multiprocessing ForkPoolWorker BrokenPipeError'ı tamamen engellemek için kaydetme ve resample iş parçacığını 1 yap
+    cmd += ["--nr_thr_saving", "1", "--nr_thr_resamp", "1"]
     
     # --fast parametresi voxel sayısını azaltarak RAM kullanımını %85 düşürür
     if fast:
@@ -169,22 +171,31 @@ def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True)
             print("    [TotalSegmentator] ✅ Organ segmentasyonları tamamlandı.")
             return True
         else:
-            # Hata varsa son 10 satırı yazdır
+            # Hata varsa son 15 satırı yazdır
             print("    [TotalSegmentator Hata Çıktısı]:")
-            for line in res.stdout.splitlines()[-10:]:
+            for line in res.stdout.splitlines()[-15:]:
                 print(f"      {line}")
     except Exception as e:
         print(f"    [TotalSegmentator] CLI alt işlem hatası: {e}")
 
-    # Fallback: Doğrudan Python API
+    # Fallback: Doğrudan Python API (Burada da nr_thr_saving=1 zorunludur)
     try:
         from totalsegmentator.python_api import totalsegmentator
         img = nib.load(nifti_path)
-        totalsegmentator(input=img, output=Path(ts_output_dir), fast=fast, roi_subset=ABDOMINAL_ROIS, quiet=False)
+        totalsegmentator(
+            input=img,
+            output=Path(ts_output_dir),
+            fast=fast,
+            roi_subset=ABDOMINAL_ROIS,
+            nr_thr_saving=1,
+            nr_thr_resamp=1,
+            quiet=False
+        )
         return last_organ_file.exists()
     except Exception as e:
         print(f"    [TotalSegmentator] Fallback hatası: {e}")
         return False
+
 
 
 
