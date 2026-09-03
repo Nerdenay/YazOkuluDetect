@@ -129,6 +129,9 @@ def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True)
     """
     TotalSegmentator alt işlemini RAM/VRAM taşmasını önleyen sınırlı worker ortamında çalıştırır.
     """
+    os.environ["TOTALSEG_DISABLE_MP"] = "1"
+    os.environ["nnUNet_def_n_proc"] = "1"
+
     Path(ts_output_dir).mkdir(parents=True, exist_ok=True)
     last_organ_file = Path(ts_output_dir) / "aorta.nii.gz"
 
@@ -333,6 +336,17 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
         except Exception as copy_err:
             print(f"    [4/4] ❌ Dosya aktarım hatası: {copy_err}\n")
             results.append({"id": case_id, "status": "HATA", "adim": "Kopyalama"})
+
+        # Döngü içindeki her hastanın en sonuna bellek temizliği:
+        import gc
+        import torch
+
+        if 'stats' in locals():
+            del stats
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
 
     # dataset.json Üretimi
     ok_count = sum(1 for r in results if r["status"] in ["OK", "TAMAMLANDI"])
