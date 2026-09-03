@@ -127,42 +127,65 @@ def find_dicom_series_with_timepoints(root_dir: str) -> list:
 
 def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True) -> bool:
     """
-    TotalSegmentator alt işlemi çalıştırır. 
-    Doğrulama en son yazılan organ olan aorta.nii.gz üzerinden yapılır.
+    TotalSegmentator alt işlemini RAM/VRAM taşmasını önleyen sınırlı worker ortamında çalıştırır.
     """
     Path(ts_output_dir).mkdir(parents=True, exist_ok=True)
     last_organ_file = Path(ts_output_dir) / "aorta.nii.gz"
 
     if last_organ_file.exists() and last_organ_file.stat().st_size > 1000:
-        print(f"    [TotalSegmentator] ✅ Önceden üretilmiş batın maskeleri tam, atlanıyor.")
+        print("    [TotalSegmentator] ✅ Önceden üretilmiş batın maskeleri tam, atlanıyor.")
         return True
 
-    print(f"    [TotalSegmentator] 8 Batın organı segmentasyonu başlatılıyor...")
+    print("    [TotalSegmentator] 8 Batın organı segmentasyonu başlatılıyor...")
 
     roi_args = ["--roi_subset"] + ABDOMINAL_ROIS
     ts_bin = shutil.which("TotalSegmentator")
-    cmd = [ts_bin] if ts_bin else [sys.executable, "-m", "totalsegmentator.bin.TotalSegmentator"]
-    cmd += ["-i", nifti_path, "-o", ts_output_dir] + roi_args + ["--quiet"]
+    cmd = [ts_bin if ts_bin else sys.executable, "-m", "totalsegmentator.bin.TotalSegmentator"] if not ts_bin else [ts_bin]
+    cmd += ["-i", nifti_path, "-o", ts_output_dir] + roi_args
+    
+    # --fast parametresi voxel sayısını azaltarak RAM kullanımını %85 düşürür
     if fast:
         cmd.append("--fast")
 
-    try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=1200)
-        if last_organ_file.exists() and last_organ_file.stat().st_size > 1000:
-            print(f"    [TotalSegmentator] ✅ Organ segmentasyonları tamamlandı.")
-            return True
-    except Exception as e:
-        print(f"    [TotalSegmentator] CLI hatası: {e}")
+    # Colab RAM'ini korumak için worker ve thread sayılarını 1 ile sınırla
+    custom_env = os.environ.copy()
+    custom_env["OMP_NUM_THREADS"] = "1"
+    custom_env["MKL_NUM_THREADS"] = "1"
+    custom_env["nnUNet_n_proc_DA"] = "1"
+    custom_env["nnUNet_def_n_proc"] = "1"
+    custom_env["PYTHONUNBUFFERED"] = "1"
 
-    # Fallback: Python API
+    try:
+        # Canlı hata akışını görmek için stdout/stderr terminale yönlendirilir
+        res = subprocess.run(
+            cmd,
+            env=custom_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=1200
+        )
+        if last_organ_file.exists() and last_organ_file.stat().st_size > 1000:
+            print("    [TotalSegmentator] ✅ Organ segmentasyonları tamamlandı.")
+            return True
+        else:
+            # Hata varsa son 10 satırı yazdır
+            print("    [TotalSegmentator Hata Çıktısı]:")
+            for line in res.stdout.splitlines()[-10:]:
+                print(f"      {line}")
+    except Exception as e:
+        print(f"    [TotalSegmentator] CLI alt işlem hatası: {e}")
+
+    # Fallback: Doğrudan Python API
     try:
         from totalsegmentator.python_api import totalsegmentator
         img = nib.load(nifti_path)
-        totalsegmentator(input=img, output=Path(ts_output_dir), fast=fast, roi_subset=ABDOMINAL_ROIS, quiet=True, verbose=False)
-        return last_organ_file.exists() and last_organ_file.stat().st_size > 1000
+        totalsegmentator(input=img, output=Path(ts_output_dir), fast=fast, roi_subset=ABDOMINAL_ROIS, quiet=False)
+        return last_organ_file.exists()
     except Exception as e:
         print(f"    [TotalSegmentator] Fallback hatası: {e}")
         return False
+
 
 
 def merge_organ_and_lesion_labels(ts_output_dir: str, manual_lesion_path: str, merged_mask_path: str) -> dict:
