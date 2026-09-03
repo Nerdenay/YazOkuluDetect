@@ -161,25 +161,20 @@ def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True)
     custom_env["PYTHONUNBUFFERED"] = "1"
 
     try:
-        # Canlı hata akışını görmek için stdout/stderr terminale yönlendirilir
+        # Çıktı doğrudan terminale akar; 64KB pipe buffer kilitlenmesi (deadlock) engellenir ve canlı ilerleme çubuğu görünür
         res = subprocess.run(
             cmd,
             env=custom_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
             timeout=1200
         )
         if last_organ_file.exists() and last_organ_file.stat().st_size > 1000:
             print("    [TotalSegmentator] ✅ Organ segmentasyonları tamamlandı.")
             return True
         else:
-            # Hata varsa son 15 satırı yazdır
-            print("    [TotalSegmentator Hata Çıktısı]:")
-            for line in res.stdout.splitlines()[-15:]:
-                print(f"      {line}")
+            print(f"    [TotalSegmentator] ⚠️ CLI tamamlanamadı (Return code: {res.returncode}), Python API deneniyor...")
     except Exception as e:
         print(f"    [TotalSegmentator] CLI alt işlem hatası: {e}")
+
 
     # Fallback: Doğrudan Python API (Burada da nr_thr_saving=1 zorunludur)
     try:
