@@ -139,12 +139,18 @@ def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True)
         print("    [TotalSegmentator] ✅ Önceden üretilmiş batın maskeleri tam, atlanıyor.")
         return True
 
-    print("    [TotalSegmentator] 8 Batın organı segmentasyonu başlatılıyor...")
+    import torch
+    use_gpu = torch.cuda.is_available()
+    device_str = "gpu" if use_gpu else "cpu"
+    print(f"    [TotalSegmentator] 8 Batın organı segmentasyonu başlatılıyor (Cihaz: {device_str.upper()})...")
+    if not use_gpu:
+        print("    ⚠️ UYARI: GPU aktif değil! İşlem CPU üzerinde hasta başına 15-20 dakika sürebilir.")
 
     roi_args = ["--roi_subset"] + ABDOMINAL_ROIS
     ts_bin = shutil.which("TotalSegmentator")
     cmd = [ts_bin if ts_bin else sys.executable, "-m", "totalsegmentator.bin.TotalSegmentator"] if not ts_bin else [ts_bin]
     cmd += ["-i", nifti_path, "-o", ts_output_dir] + roi_args
+    cmd += ["--device", device_str]
     # Multiprocessing ForkPoolWorker BrokenPipeError'ı tamamen engellemek için kaydetme ve resample iş parçacığını 1 yap
     cmd += ["--nr_thr_saving", "1", "--nr_thr_resamp", "1"]
     
@@ -160,6 +166,7 @@ def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True)
     custom_env["nnUNet_def_n_proc"] = "1"
     custom_env["PYTHONUNBUFFERED"] = "1"
 
+    ts_start = datetime.now()
     try:
         # Çıktı doğrudan terminale akar; 64KB pipe buffer kilitlenmesi (deadlock) engellenir ve canlı ilerleme çubuğu görünür
         res = subprocess.run(
@@ -167,8 +174,9 @@ def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True)
             env=custom_env,
             timeout=1200
         )
+        ts_elapsed = int((datetime.now() - ts_start).total_seconds())
         if last_organ_file.exists() and last_organ_file.stat().st_size > 1000:
-            print("    [TotalSegmentator] ✅ Organ segmentasyonları tamamlandı.")
+            print(f"    [TotalSegmentator] ✅ Organ segmentasyonları tamamlandı ({ts_elapsed} sn).")
             return True
         else:
             print(f"    [TotalSegmentator] ⚠️ CLI tamamlanamadı (Return code: {res.returncode}), Python API deneniyor...")
@@ -265,12 +273,20 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
     images_tr = nnunet_paths["imagesTr"]
     labels_tr = nnunet_paths["labelsTr"]
 
+    import torch
+    has_cuda = torch.cuda.is_available()
+    gpu_name = torch.cuda.get_device_name(0) if has_cuda else "YOK (DİKKAT: CPU MODU!)"
+
     print(f"\n{'='*65}")
     print(f"  HepaRECIST-AI: Multi-Organ & Tümör Veri Hazırlama Pipeline")
     print(f"{'='*65}")
-    print(f"  Kaynak DICOM     : {dicom_root}")
-    print(f"  Manuel Lezyonlar : {manual_lesions_dir if manual_lesions_dir else 'Belirtilmedi (Sadece organlar)'}")
-    print(f"  Nihai Hedef      : {nnunet_paths['dataset_dir']}")
+    print(f"  Hesaplama Donanımı : {'CUDA GPU (' + gpu_name + ')' if has_cuda else '⚠️ CPU (DİKKAT: Aşırı yavaş!)'}")
+    print(f"  Kaynak DICOM       : {dicom_root}")
+    print(f"  Manuel Lezyonlar   : {manual_lesions_dir if manual_lesions_dir else 'Belirtilmedi (Sadece organlar)'}")
+    print(f"  Nihai Hedef        : {nnunet_paths['dataset_dir']}")
+    if not has_cuda:
+        print("  ⚠️ UYARI: Colab GPU aktif değil! TotalSegmentator CPU modunda")
+        print("           hasta başına 15-20 dakika sürer! Lütfen menüden T4 GPU seçin.")
     print(f"{'='*65}\n")
 
     series_list = find_dicom_series_with_timepoints(dicom_root)
@@ -288,12 +304,26 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
             results.append({"id": case_id, "status": "TAMAMLANDI", "source": item["path"]})
             continue
 
+        case_start = datetime.now()
+
         # 1. DICOM → NIfTI
         nifti_out = str(nifti_dir / f"{case_id}.nii.gz")
         try:
-            if not (os.path.exists(nifti_out) and os.path.getsize(nifti_out) > 1000):
+            # Eğer Drive'da imagesTr içinde NIfTI görüntüsü zaten varsa (önceki yarıda kalmış denemeden),
+            # 600 DICOM dosyasını ağdan okumak yerine direkt Drive'daki NIfTI'ı kopyala (2-3 dk kazandırır)
+            if final_img.exists() and final_img.stat().st_size > 1000:
+                print(f"    [1/4] ⚡ NIfTI görüntüsü Drive imagesTr'de mevcut, doğrudan alınıyor...")
+                if not (os.path.exists(nifti_out) and os.path.getsize(nifti_out) > 1000):
+                    shutil.copy2(str(final_img), nifti_out)
+                print(f"    [1/4] ✅ NIfTI hazır (Drive önbelleğinden)")
+            elif not (os.path.exists(nifti_out) and os.path.getsize(nifti_out) > 1000):
+                t_dcm = datetime.now()
+                print(f"    [1/4] ⏳ DICOM -> NIfTI dönüştürülüyor ({item['slice_count']} kesit, Drive üzerinden okunuyor)...")
                 convert_dicom_to_nifti(item["path"], str(nifti_dir), f"{case_id}.nii.gz")
-            print(f"    [1/4] ✅ NIfTI dönüşümü OK")
+                dcm_dur = int((datetime.now() - t_dcm).total_seconds())
+                print(f"    [1/4] ✅ NIfTI dönüşümü OK ({dcm_dur} sn)")
+            else:
+                print(f"    [1/4] ✅ NIfTI dönüşümü OK (yerel SSD önbellek)")
         except Exception as e:
             print(f"    [1/4] ❌ NIfTI dönüşüm hatası: {e}\n")
             results.append({"id": case_id, "status": "HATA", "adim": "NIfTI"})
@@ -319,14 +349,19 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
                     break
 
         merged_label_path = str(merged_dir / f"{case_id}.nii.gz")
+        t_merge = datetime.now()
         stats = merge_organ_and_lesion_labels(ts_case_dir, manual_lesion_file, merged_label_path)
-        print(f"    [3/4] ✅ Etiketler birleştirildi (Karaciğer: {stats['liver_voxels']:,} | Lezyon: {stats['lesion_voxels']:,} vx)")
+        merge_dur = int((datetime.now() - t_merge).total_seconds())
+        print(f"    [3/4] ✅ Etiketler birleştirildi ({merge_dur} sn) (Karaciğer: {stats['liver_voxels']:,} | Lezyon: {stats['lesion_voxels']:,} vx)")
 
         # 4. nnU-Net v2 Dizinine Kopyala
         try:
+            t_copy = datetime.now()
             shutil.copy2(nifti_out, str(final_img))
             shutil.copy2(merged_label_path, str(final_lbl))
-            print(f"    [4/4] ✅ nnU-Net klasörüne aktarıldı.\n")
+            copy_dur = int((datetime.now() - t_copy).total_seconds())
+            case_dur = int((datetime.now() - case_start).total_seconds())
+            print(f"    [4/4] ✅ nnU-Net klasörüne aktarıldı ({copy_dur} sn - Hasta toplam süre: {case_dur} sn).\n")
             results.append({"id": case_id, "status": "OK", "has_lesion": stats["has_lesion"]})
         except Exception as copy_err:
             print(f"    [4/4] ❌ Dosya aktarım hatası: {copy_err}\n")
