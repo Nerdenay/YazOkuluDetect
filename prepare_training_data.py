@@ -25,6 +25,23 @@ from pathlib import Path
 from datetime import datetime
 import numpy as np
 import nibabel as nib
+import gc
+import ctypes
+
+def force_ram_cleanup():
+    """Python çöp toplayıcısını çalıştırır ve Linux çekirdeğine RAM'i zorla iade eder."""
+    gc.collect()
+    try:
+        # glibc heap belleğini Linux kernel'a geri verir
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 # ── Sistem modüllerini import et ─────────────────────────────────────────────
 try:
@@ -179,65 +196,54 @@ def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True)
             print(f"    [TotalSegmentator] ✅ Organ segmentasyonları tamamlandı ({ts_elapsed} sn).")
             return True
         else:
-            print(f"    [TotalSegmentator] ⚠️ CLI tamamlanamadı (Return code: {res.returncode}), Python API deneniyor...")
+            print(f"    [TotalSegmentator] ⚠️ CLI tamamlanamadı (Return code: {res.returncode})")
+            # Eğer OOM (-9) olduysa Python API'yi notebook içinde çalıştırma (Kernel çöker!)
+            if res.returncode == -9:
+                print("    [UYARI] ⚠️ Linux OOM Killer devreye girdi (RAM yetersizliği). Bellek temizleniyor...")
+                force_ram_cleanup()
+                return False
     except Exception as e:
         print(f"    [TotalSegmentator] CLI alt işlem hatası: {e}")
-
-
-    # Fallback: Doğrudan Python API (Burada da nr_thr_saving=1 zorunludur)
-    try:
-        from totalsegmentator.python_api import totalsegmentator
-        img = nib.load(nifti_path)
-        totalsegmentator(
-            input=img,
-            output=Path(ts_output_dir),
-            fast=fast,
-            roi_subset=ABDOMINAL_ROIS,
-            nr_thr_saving=1,
-            nr_thr_resamp=1,
-            quiet=False
-        )
-        return last_organ_file.exists()
-    except Exception as e:
-        print(f"    [TotalSegmentator] Fallback hatası: {e}")
+        force_ram_cleanup()
         return False
 
+    return last_organ_file.exists() and last_organ_file.stat().st_size > 1000
 
 
 
-def merge_organ_and_lesion_labels(ts_output_dir: str, manual_lesion_path: str, merged_mask_path: str) -> dict:
+
+def merge_organ_and_lesion_labels(ts_output_dir: str, ref_nifti_path: str, manual_lesion_path: str, merged_mask_path: str) -> dict:
     """
-    Organ maskelerini (1-7) ve varsa kullanıcının etiketlediği lezyon maskesini (8) birleştirir.
-    Lezyon vokselleri organın üzerine (overwriting) yazılır.
+    Organ maskelerini (1-7) ve varsa lezyon maskesini (8) birleştirir.
+    Geometri referansı olarak doğrudan orijinal nifti_path kullanılır.
     """
     ts_dir = Path(ts_output_dir)
-    ref_file = ts_dir / "liver.nii.gz"
-
     stats = {
         "liver_voxels": 0, "spleen_voxels": 0, "kidney_voxels": 0,
         "pancreas_voxels": 0, "lesion_voxels": 0, "has_lesion": False
     }
 
-    if not ref_file.exists():
-        print(f"    [Birleştirme] ⚠️ Referans organ maskesi (liver) bulunamadı.")
+    if not os.path.exists(ref_nifti_path):
+        print(f"    [Birleştirme] ⚠️ Referans NIfTI bulunamadı: {ref_nifti_path}")
         return stats
 
-    ref_img = nib.load(str(ref_file))
+    ref_img = nib.load(ref_nifti_path)
     merged = np.zeros(ref_img.shape, dtype=np.uint8)
 
-    # 1. TotalSegmentator Organ Maskelerini Birleştir (1-7)
+    # 1. Organ Maskelerini Birleştir (1-7)
     for roi, label_idx in ORGAN_LABEL_MAP.items():
         roi_file = ts_dir / f"{roi}.nii.gz"
         if roi_file.exists():
             roi_data = nib.load(str(roi_file)).get_fdata()
-            merged[roi_data > 0] = label_idx
-            vox = int(np.sum(roi_data > 0))
-            if roi == "liver": stats["liver_voxels"] = vox
-            elif roi == "spleen": stats["spleen_voxels"] = vox
-            elif "kidney" in roi: stats["kidney_voxels"] += vox
-            elif roi == "pancreas": stats["pancreas_voxels"] = vox
+            if roi_data.shape == merged.shape:
+                merged[roi_data > 0] = label_idx
+                vox = int(np.sum(roi_data > 0))
+                if roi == "liver": stats["liver_voxels"] = vox
+                elif roi == "spleen": stats["spleen_voxels"] = vox
+                elif "kidney" in roi: stats["kidney_voxels"] += vox
+                elif roi == "pancreas": stats["pancreas_voxels"] = vox
 
-    # 2. Manuel Lezyon Maskesini Birleştir (Label 8)
+    # 2. Varsa Manuel Lezyon Maskesini Birleştir (Label 8)
     if manual_lesion_path and os.path.exists(manual_lesion_path):
         lesion_img = nib.load(manual_lesion_path)
         lesion_data = lesion_img.get_fdata()
@@ -247,9 +253,12 @@ def merge_organ_and_lesion_labels(ts_output_dir: str, manual_lesion_path: str, m
             stats["has_lesion"] = stats["lesion_voxels"] > 0
             print(f"    [Lezyon Entegre] ✅ Label 8 eklendi ({stats['lesion_voxels']:,} voxel)")
         else:
-            print(f"    [UYARI] ⚠️ Lezyon maskesi ve BT boyutları uyuşmuyor: {lesion_data.shape} vs {merged.shape}")
+            print(f"    [UYARI] ⚠️ Lezyon maskesi boyutu uyuşmuyor: {lesion_data.shape} vs {merged.shape}")
 
-    nib.save(nib.Nifti1Image(merged, ref_img.affine, ref_img.header), merged_mask_path)
+    # Temiz uint8 başlık ve orijinal affine ile kaydet (scl_inter=-1024 kaymasını önler)
+    out_nii = nib.Nifti1Image(merged, ref_img.affine)
+    out_nii.set_data_dtype(np.uint8)
+    nib.save(out_nii, merged_mask_path)
     return stats
 
 
@@ -329,6 +338,8 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
             results.append({"id": case_id, "status": "HATA", "adim": "NIfTI"})
             continue
 
+        force_ram_cleanup()
+
         # 2. TotalSegmentator
         ts_case_dir = str(ts_masks_dir / case_id)
         ts_ok = run_totalsegmentator(nifti_out, ts_case_dir, fast=fast_mode)
@@ -350,7 +361,7 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
 
         merged_label_path = str(merged_dir / f"{case_id}.nii.gz")
         t_merge = datetime.now()
-        stats = merge_organ_and_lesion_labels(ts_case_dir, manual_lesion_file, merged_label_path)
+        stats = merge_organ_and_lesion_labels(ts_case_dir, nifti_out, manual_lesion_file, merged_label_path)
         merge_dur = int((datetime.now() - t_merge).total_seconds())
         print(f"    [3/4] ✅ Etiketler birleştirildi ({merge_dur} sn) (Karaciğer: {stats['liver_voxels']:,} | Lezyon: {stats['lesion_voxels']:,} vx)")
 
@@ -361,32 +372,39 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
             shutil.copy2(merged_label_path, str(final_lbl))
             copy_dur = int((datetime.now() - t_copy).total_seconds())
             case_dur = int((datetime.now() - case_start).total_seconds())
-            print(f"    [4/4] ✅ nnU-Net klasörüne aktarıldı ({copy_dur} sn - Hasta toplam süre: {case_dur} sn).\n")
+            print(f"    [4/4] ✅ nnU-Net klasörüne aktarıldı ({copy_dur} sn - Vaka süresi: {case_dur} sn).\n")
             results.append({"id": case_id, "status": "OK", "has_lesion": stats["has_lesion"]})
         except Exception as copy_err:
             print(f"    [4/4] ❌ Dosya aktarım hatası: {copy_err}\n")
             results.append({"id": case_id, "status": "HATA", "adim": "Kopyalama"})
 
-        # Döngü içindeki her hastanın en sonuna bellek temizliği:
-        import gc
-        import torch
+        # 5. DISK TEMİZLİĞİ: Yerel SSD'de biriken 8 organ maskesini ve ham NIfTI'yi sil (Colab disk dolmasını önler)
+        if os.path.exists(ts_case_dir):
+            shutil.rmtree(ts_case_dir, ignore_errors=True)
+        if os.path.exists(merged_label_path):
+            os.remove(merged_label_path)
+        if os.path.exists(nifti_out):
+            os.remove(nifti_out)
 
+        # 6. Bellek Temizliği (Linux glibc malloc_trim + PyTorch CUDA)
         if 'stats' in locals():
             del stats
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        force_ram_cleanup()
 
 
-    # dataset.json Üretimi
+    # dataset.json Üretimi (HepaRECIST-AI 8 Sınıflı Standart Şema)
     ok_count = sum(1 for r in results if r["status"] in ["OK", "TAMAMLANDI"])
     labels_dict = {
-        "background": 0, "liver": 1, "spleen": 2, "kidneys": 3,
-        "pancreas": 4, "gallbladder": 5, "stomach": 6, "aorta": 7
+        "background": 0,
+        "liver": 1,
+        "spleen": 2,
+        "kidneys": 3,
+        "pancreas": 4,
+        "gallbladder": 5,
+        "stomach": 6,
+        "aorta": 7,
+        "lesion": 8
     }
-    has_any_lesion = any(r.get("has_lesion") for r in results)
-    if has_any_lesion:
-        labels_dict["lesion"] = 8
 
     generate_dataset_json(
         dataset_dir=nnunet_paths["dataset_dir"],
