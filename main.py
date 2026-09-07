@@ -64,7 +64,7 @@ class LongitudinalRequest(BaseModel):
     output_dir: str = "./output/longitudinal"
 
 class DecisionRequest(BaseModel):
-    sod_baseline: float = Field(..., gt=0, description="Tedavi başlangıç (Baseline) hedef lezyon çap toplamı (mm)")
+    sod_baseline: float = Field(..., ge=0, description="Tedavi başlangıç (Baseline) hedef lezyon çap toplamı (mm)")
     sod_followup: float = Field(..., ge=0, description="Takip (Follow-up) hedef lezyon çap toplamı (mm)")
     sod_nadir: Optional[float] = Field(None, description="Takip süresince görülen en küçük SOD değeri (Nadir). Yoksa baseline alınır.")
     new_lesion: bool = Field(False, description="Yeni lezyon tespit edildi mi?")
@@ -254,14 +254,32 @@ def recist_decision_endpoint(request: DecisionRequest):
     """
     nadir_val = request.sod_nadir if (request.sod_nadir is not None and request.sod_nadir > 0) else request.sod_baseline
 
-    change_from_baseline_pct = ((request.sod_followup - request.sod_baseline) / request.sod_baseline) * 100
-    change_from_nadir_pct = ((request.sod_followup - nadir_val) / nadir_val) * 100
+    if request.sod_baseline > 0:
+        change_from_baseline_pct = ((request.sod_followup - request.sod_baseline) / request.sod_baseline) * 100
+    else:
+        change_from_baseline_pct = 100.0 if request.sod_followup > 0 else 0.0
+
+    if nadir_val > 0:
+        change_from_nadir_pct = ((request.sod_followup - nadir_val) / nadir_val) * 100
+    else:
+        change_from_nadir_pct = 100.0 if request.sod_followup > 0 else 0.0
+
     absolute_nadir_diff = request.sod_followup - nadir_val
 
     # 1. Kural: Yeni Lezyon Varlığı = Kesin Progresyon (PD)
     if request.new_lesion:
         decision = "PD"
         reason = "Yeni lezyon tespit edildi. Doğrudan Progresif Hastalık (PD) kararı verildi."
+
+    # 1b. Kural: Başlangıçta hedef lezyon yokken takipte yeni lezyon çıkması = PD
+    elif request.sod_baseline == 0 and request.sod_followup > 0:
+        decision = "PD"
+        reason = f"Başlangıçta lezyon yokken takipte yeni lezyon yükü (+{request.sod_followup:.1f} mm) tespit edildi (PD)."
+
+    # 1c. Kural: Başlangıçta ve takipte lezyon olmaması = CR / Lezyonsuz
+    elif request.sod_baseline == 0 and request.sod_followup == 0:
+        decision = "CR"
+        reason = "Başlangıç ve takip tetkiklerinde hedef lezyon saptanmamıştır (Tam Yanıt / Lezyonsuz)."
     
     # 2. Kural: Nadir'e göre en az %20 VE mutlak en az 5 mm artış = Progresyon (PD)
     elif change_from_nadir_pct >= 20.0 and absolute_nadir_diff >= 5.0:

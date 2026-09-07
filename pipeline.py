@@ -145,8 +145,26 @@ def run_full_pipeline(baseline_dicom_dir: str, followup_dicom_dir: str,
         baseline_mask=bl_mask,
         followup_ct=fu_final,
         followup_mask=fu_mask,
-        output_dir=longitudinal_dir
+        output_dir=longitudinal_dir,
+        lesion_label_id=lesion_label_id
     )
+
+    # 4D Longitudinal Yan Yana Karşılaştırma Görselini Üret
+    from visualizer import generate_longitudinal_comparison
+    longitudinal_preview_png = os.path.join(longitudinal_dir, "longitudinal_comparison.png")
+    try:
+        generate_longitudinal_comparison(
+            baseline_ct=bl_final,
+            baseline_mask=bl_mask,
+            followup_ct=fu_final,
+            followup_mask=fu_mask,
+            matching_results=longitudinal_result,
+            output_png_path=longitudinal_preview_png,
+            lesion_label_id=lesion_label_id
+        )
+    except Exception as e:
+        print(f"  [UYARI] Longitudinal görselleştirme üretilemedi: {e}")
+        longitudinal_preview_png = fu_seg.get("preview_image_path", "")
 
     results["longitudinal"] = longitudinal_result
     print("  [✓] 4D Longitudinal takip ve lezyon eşleştirme tamamlandı.")
@@ -170,6 +188,12 @@ def run_full_pipeline(baseline_dicom_dir: str, followup_dicom_dir: str,
     if has_new:
         decision = "PD"
         reason = "Yeni lezyon tespit edildi. Kesin Progresif Hastalık (PD)."
+    elif sod_bl == 0.0 and sod_fu > 0.0:
+        decision = "PD"
+        reason = f"Başlangıçta hedef lezyon yokken takipte yeni lezyon yükü (+{sod_fu:.1f} mm) tespit edildi (PD)."
+    elif sod_bl == 0.0 and sod_fu == 0.0:
+        decision = "CR"
+        reason = "Başlangıç ve takip tetkiklerinde hedef lezyon saptanmamıştır (Tam Yanıt / Lezyonsuz)."
     elif change_pct >= 20.0 and (sod_fu - sod_bl) >= 5.0:
         decision = "PD"
         reason = f"Tümör yükünde en az %20 ve mutlak en az 5mm artış tespit edildi (Değişim: %{change_pct:.1f})."
@@ -222,6 +246,19 @@ def run_full_pipeline(baseline_dicom_dir: str, followup_dicom_dir: str,
     )
 
     results["report"] = report_result
+
+    # C# WPF İstemcisi ile geriye dönük tam uyumluluk anahtarları
+    results["preview_image_path"] = longitudinal_preview_png
+    results["segmentation_followup"] = fu_seg
+    results["segmentation_baseline"] = bl_seg
+    matched_pairs = longitudinal_result.get("matching", {}).get("matched_pairs", [])
+    results["matching"] = {
+        "matched_lesions": len(matched_pairs),
+        "sod_baseline": round(sod_bl, 2),
+        "sod_followup": round(sod_fu, 2),
+        "change_percentage": round(change_pct, 2),
+        "has_new_lesions": has_new
+    }
 
     # Raporu diske yaz
     timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -280,7 +317,48 @@ def run_single_timepoint_pipeline(dicom_dir: str,
     print("\n[ADIM 3/3] Radyomik Doku Analizi...")
     radiomics_result = analyze_ct_and_mask_radiomics(final_ct, mask_path, lesion_label_id=lesion_label_id)
 
-    print(f"\n[✓] Tekil analiz tamamlandı. Tespit edilen lezyon: {seg_result.get('detected_lesions_count', 0)}")
+    lesion_count = seg_result.get("detected_lesions_count", 0)
+    total_vol = seg_result.get("total_volume_mm3", 0.0)
+    sod_val = seg_result.get("primary_lesion_diameter_mm", 0.0)
+    preview_png = seg_result.get("preview_image_path", "")
+
+    # 4. Klinik Rapor Üretimi (Tekil Tetkik)
+    reports_dir = os.path.join(output_dir, "reports")
+    os.makedirs(reports_dir, exist_ok=True)
+    report_input = {
+        "segmentation": seg_result,
+        "radiomics": radiomics_result,
+        "longitudinal": {
+            "baseline_targets": lesion_count,
+            "followup_lesions": lesion_count,
+            "recist_metrics": {
+                "sod_baseline": sod_val,
+                "sod_followup": sod_val,
+                "sod_change_pct": 0.0,
+                "has_new_lesions": False
+            }
+        },
+        "recist_decision": {
+            "baseline_sod": sod_val,
+            "followup_sod": sod_val,
+            "change_percentage": 0.0,
+            "new_lesion": False,
+            "decision": "BL",
+            "explanation": f"Tekil / Başlangıç tetkiki: {lesion_count} lezyon odağı tespit edildi (SOD: {sod_val:.1f} mm)."
+        }
+    }
+    report_result = generate_clinical_report(
+        pipeline_results=report_input,
+        patient_info=patient_info
+    )
+
+    timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+    report_file = os.path.join(reports_dir, f"single_report_{timestamp_str}.txt")
+    with open(report_file, "w", encoding="utf-8") as f:
+        f.write(report_result.get("report_text", ""))
+    report_result["saved_to"] = report_file
+
+    print(f"\n[✓] Tekil analiz tamamlandı. Tespit edilen lezyon: {lesion_count}")
     return {
         "status": "success",
         "mode": "single_timepoint",
@@ -288,6 +366,11 @@ def run_single_timepoint_pipeline(dicom_dir: str,
         "mask_path": mask_path,
         "segmentation": seg_result,
         "radiomics": radiomics_result,
+        "report": report_result,
+        "lesion_count": lesion_count,
+        "total_volume_mm3": total_vol,
+        "sod_mm": sod_val,
+        "preview_image_path": preview_png,
         "note": "RECIST 1.1 tedavi yanıtı için en az iki zamanlı (t0, t1) çekim gereklidir."
     }
 

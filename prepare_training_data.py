@@ -25,6 +25,7 @@ from pathlib import Path
 from datetime import datetime
 import numpy as np
 import nibabel as nib
+import scipy.ndimage as ndimage
 import gc
 import ctypes
 
@@ -42,6 +43,20 @@ def force_ram_cleanup():
             torch.cuda.empty_cache()
     except Exception:
         pass
+
+
+def is_drive_connected(target_path: str = "/content/drive/MyDrive") -> bool:
+    """
+    Google Drive FUSE bağlantısının canlı olup olmadığını kontrol eder.
+    Hedef yol '/content/drive' içermiyorsa (örneğin yerel disk veya Windows), kontrolü atlar (True döner).
+    """
+    if not target_path or "/content/drive" not in str(target_path).replace("\\", "/"):
+        return True
+    try:
+        os.stat(target_path)
+        return True
+    except (OSError, Exception):
+        return False
 
 
 # ── Sistem modüllerini import et ─────────────────────────────────────────────
@@ -154,8 +169,6 @@ def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True)
     use_gpu = torch.cuda.is_available()
     device_str = "gpu" if use_gpu else "cpu"
     print(f"    [TotalSegmentator] 8 Batın organı segmentasyonu başlatılıyor (Cihaz: {device_str.upper()})...")
-    if not use_gpu:
-        print("    ⚠️ UYARI: GPU aktif değil! İşlem CPU üzerinde hasta başına 15-20 dakika sürebilir.")
 
     roi_args = ["--roi_subset"] + ABDOMINAL_ROIS
     ts_bin = shutil.which("TotalSegmentator")
@@ -188,8 +201,8 @@ def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True)
         else:
             print(f"    [TotalSegmentator] ⚠️ CLI tamamlanamadı (Return code: {res.returncode})")
             if res.returncode == -9:
-                print("    [UYARI] ⚠️ Linux OOM Killer devreye girdi (RAM yetersizliği). Bellek temizleniyor...")
-                force_ram_cleanup()
+                print("    [UYARI] ⚠️ Linux OOM Killer devreye girdi. Bellek temizleniyor...")
+            force_ram_cleanup()
             return False
     except Exception as e:
         print(f"    [TotalSegmentator] CLI alt işlem hatası: {e}")
@@ -209,34 +222,54 @@ def merge_organ_and_lesion_labels(ts_output_dir: str, ref_nifti_path: str, manua
         return stats
 
     ref_img = nib.load(ref_nifti_path)
-    merged = np.zeros(ref_img.shape, dtype=np.uint8)
+    target_shape = ref_img.shape
+    merged = np.zeros(target_shape, dtype=np.uint8)
 
     # 1. Organ Maskelerini Birleştir (1-7)
     for roi, label_idx in ORGAN_LABEL_MAP.items():
         roi_file = ts_dir / f"{roi}.nii.gz"
         if roi_file.exists():
             roi_data = nib.load(str(roi_file)).get_fdata()
-            if roi_data.shape == merged.shape:
-                merged[roi_data > 0] = label_idx
-                vox = int(np.sum(roi_data > 0))
-                if roi == "liver": stats["liver_voxels"] = vox
-                elif roi == "spleen": stats["spleen_voxels"] = vox
-                elif "kidney" in roi: stats["kidney_voxels"] += vox
-                elif roi == "pancreas": stats["pancreas_voxels"] = vox
+            # Eğer TotalSegmentator z-downsampled hacimde çalıştıysa, orijinal kesit boyutuna geri oturt
+            if roi_data.shape != target_shape:
+                zoom_factors = [t / s for t, s in zip(target_shape, roi_data.shape)]
+                roi_data = ndimage.zoom(roi_data.astype(np.uint8), zoom_factors, order=0)
+                # Olası float yuvarlama uyuşmazlığına karşı target_shape'e tam oturt
+                if roi_data.shape != target_shape:
+                    adjusted = np.zeros(target_shape, dtype=roi_data.dtype)
+                    min_shape = tuple(min(s, t) for s, t in zip(roi_data.shape, target_shape))
+                    src_slices = tuple(slice(0, m) for m in min_shape)
+                    dst_slices = tuple(slice(0, m) for m in min_shape)
+                    adjusted[dst_slices] = roi_data[src_slices]
+                    roi_data = adjusted
+
+            merged[roi_data > 0] = label_idx
+            vox = int(np.sum(roi_data > 0))
+            if roi == "liver": stats["liver_voxels"] = vox
+            elif roi == "spleen": stats["spleen_voxels"] = vox
+            elif "kidney" in roi: stats["kidney_voxels"] += vox
+            elif roi == "pancreas": stats["pancreas_voxels"] = vox
 
     # 2. Varsa Manuel Lezyon Maskesini Birleştir (Label 8)
     if manual_lesion_path and os.path.exists(manual_lesion_path):
         lesion_img = nib.load(manual_lesion_path)
         lesion_data = lesion_img.get_fdata()
-        if lesion_data.shape == merged.shape:
-            merged[lesion_data > 0] = 8
-            stats["lesion_voxels"] = int(np.sum(lesion_data > 0))
-            stats["has_lesion"] = stats["lesion_voxels"] > 0
-            print(f"    [Lezyon Entegre] ✅ Label 8 eklendi ({stats['lesion_voxels']:,} voxel)")
-        else:
-            print(f"    [UYARI] ⚠️ Lezyon maskesi boyutu uyuşmuyor: {lesion_data.shape} vs {merged.shape}")
+        if lesion_data.shape != target_shape:
+            zoom_factors = [t / s for t, s in zip(target_shape, lesion_data.shape)]
+            lesion_data = ndimage.zoom(lesion_data.astype(np.uint8), zoom_factors, order=0)
+            if lesion_data.shape != target_shape:
+                adjusted = np.zeros(target_shape, dtype=lesion_data.dtype)
+                min_shape = tuple(min(s, t) for s, t in zip(lesion_data.shape, target_shape))
+                src_slices = tuple(slice(0, m) for m in min_shape)
+                dst_slices = tuple(slice(0, m) for m in min_shape)
+                adjusted[dst_slices] = lesion_data[src_slices]
+                lesion_data = adjusted
 
-    # ref_img.header bilerek eklenmez; temiz uint8 başlık ve orijinal affine korunur
+        merged[lesion_data > 0] = 8
+        stats["lesion_voxels"] = int(np.sum(lesion_data > 0))
+        stats["has_lesion"] = stats["lesion_voxels"] > 0
+        print(f"    [Lezyon Entegre] ✅ Label 8 eklendi ({stats['lesion_voxels']:,} voxel)")
+
     out_nii = nib.Nifti1Image(merged, ref_img.affine)
     out_nii.set_data_dtype(np.uint8)
     nib.save(out_nii, merged_mask_path)
@@ -271,22 +304,26 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
     print(f"  Hesaplama Donanımı : {'CUDA GPU (' + gpu_name + ')' if has_cuda else '⚠️ CPU (DİKKAT: Aşırı yavaş!)'}")
     print(f"  Kaynak DICOM       : {dicom_root}")
     print(f"  Manuel Lezyonlar   : {manual_lesions_dir if manual_lesions_dir else 'Belirtilmedi (Sadece organlar)'}")
-    print(f"  Nihai Hedef        : {nnunet_paths['dataset_dir']}")
-    if not has_cuda:
-        print("  ⚠️ UYARI: Colab GPU aktif değil! Lütfen menüden T4 GPU seçin.")
-    print(f"{'='*65}\n")
+    print(f"  Nihai Hedef        : {nnunet_paths['dataset_dir']}\n{'='*65}\n")
 
     series_list = find_dicom_series_with_timepoints(dicom_root)
     results = []
 
     for idx, item in enumerate(series_list, 1):
         case_id = item["case_id"]
+
+        # Drive FUSE kontrolü: Hedef Drive ise ve bağlantı kopmuşsa durdur
+        if not is_drive_connected(str(output_path)):
+            print("\n🚨 KRİTİK HATA: Google Drive FUSE bağlantısı koptu!")
+            print("   İşlem veri kaybını önlemek için güvenle durduruldu.")
+            print("   Lütfen Drive'ı yeniden bağlayıp scripti tekrar çalıştırın.\n")
+            break
+
         print(f"[{idx}/{len(series_list)}] {item['folder_name']} [{item['timepoint'].upper()}] → {case_id}")
 
         final_img = Path(images_tr) / f"{case_id}_0000.nii.gz"
         final_lbl = Path(labels_tr) / f"{case_id}.nii.gz"
 
-        # Drive FUSE kopmalarına karşı korumalı Resume kontrolü
         already_completed = False
         try:
             if final_img.is_file() and final_lbl.is_file():
@@ -325,13 +362,39 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
 
         force_ram_cleanup()
 
-        # 2. TotalSegmentator
+        # 2. TotalSegmentator Ön Hazırlık (Akıllı Z-Throttling: 520+ Kesit Koruması)
         ts_case_dir = str(ts_masks_dir / case_id)
-        ts_ok = run_totalsegmentator(nifti_out, ts_case_dir, fast=fast_mode)
+        input_for_ts = nifti_out
+        tmp_throttled_nii = None
+
+        try:
+            full_nii = nib.load(nifti_out)
+            orig_shape = full_nii.shape
+            # Eğer kesit sayısı > 520 ise (Colab 12GB RAM'ini patlatacak büyüklükte)
+            if orig_shape[2] > 520:
+                print(f"    [RAM Koruması] 🛡️ Kesit sayısı yüksek ({orig_shape[2]}). TotalSegmentator için z seyreltiliyor...")
+                throttled_data = full_nii.get_fdata()[:, :, ::2]
+                new_affine = full_nii.affine.copy()
+                new_affine[:3, 2] *= 2.0  # Z spacing'i 2 katına çıkar
+                tmp_throttled_nii = str(nifti_dir / f"{case_id}_throttled.nii.gz")
+                nib.save(nib.Nifti1Image(throttled_data.astype(np.int16), new_affine), tmp_throttled_nii)
+                input_for_ts = tmp_throttled_nii
+                del throttled_data
+                force_ram_cleanup()
+        except Exception as throttle_err:
+            print(f"    [UYARI] Seyreltme uygulanamadı: {throttle_err}")
+            input_for_ts = nifti_out
+
+        # TotalSegmentator'ı Çalıştır
+        ts_ok = run_totalsegmentator(input_for_ts, ts_case_dir, fast=fast_mode)
+
+        # Geçici seyreltilmiş NIfTI'yi hemen sil
+        if tmp_throttled_nii and os.path.exists(tmp_throttled_nii):
+            os.remove(tmp_throttled_nii)
+
         if not ts_ok:
             print(f"    [2/4] ❌ TotalSegmentator organ maskeleri üretilemedi.\n")
             results.append({"id": case_id, "status": "HATA", "adim": "TotalSegmentator"})
-            # Başarısız olsa dahi diski temizle ve belleği sıfırla
             if os.path.exists(ts_case_dir):
                 shutil.rmtree(ts_case_dir, ignore_errors=True)
             if os.path.exists(nifti_out):
@@ -340,7 +403,7 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
             continue
         print(f"    [2/4] ✅ TotalSegmentator organ maskeleri hazır")
 
-        # 3. Manuel Lezyon Maskesini Bul ve Birleştir
+        # 3. Manuel Lezyon Maskesini Bul ve Birleştir (Orijinal Kesit Boyutuna Geri Büyütme)
         manual_lesion_file = None
         if manual_lesions_dir:
             possible_names = [f"{case_id}.nii.gz", f"{case_id}_lesion.nii.gz", f"{item['folder_name']}_{item['timepoint']}.nii.gz"]
@@ -369,7 +432,7 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
             print(f"    [4/4] ❌ Dosya aktarım hatası: {copy_err}\n")
             results.append({"id": case_id, "status": "HATA", "adim": "Kopyalama"})
 
-        # 5. DISK TEMİZLİĞİ: Yerel SSD'de biriken maskeleri ve ham NIfTI'yi sil (80GB diskin dolmasını önler)
+        # 5. DİSK TEMİZLİĞİ: Yerel SSD'deki geçici dosyaları sil
         if os.path.exists(ts_case_dir):
             shutil.rmtree(ts_case_dir, ignore_errors=True)
         if os.path.exists(merged_label_path):
@@ -383,26 +446,27 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
         force_ram_cleanup()
 
     # dataset.json Üretimi
-    ok_count = sum(1 for r in results if r["status"] in ["OK", "TAMAMLANDI"])
-    labels_dict = {
-        "background": 0, "liver": 1, "spleen": 2, "kidneys": 3,
-        "pancreas": 4, "gallbladder": 5, "stomach": 6, "aorta": 7,
-        "lesion": 8
-    }
+    if is_drive_connected(str(output_path)):
+        ok_count = sum(1 for r in results if r["status"] in ["OK", "TAMAMLANDI"])
+        labels_dict = {
+            "background": 0, "liver": 1, "spleen": 2, "kidneys": 3,
+            "pancreas": 4, "gallbladder": 5, "stomach": 6, "aorta": 7,
+            "lesion": 8
+        }
 
-    generate_dataset_json(
-        dataset_dir=nnunet_paths["dataset_dir"],
-        num_training_cases=ok_count,
-        labels=labels_dict
-    )
+        generate_dataset_json(
+            dataset_dir=nnunet_paths["dataset_dir"],
+            num_training_cases=ok_count,
+            labels=labels_dict
+        )
 
-    elapsed = int((datetime.now() - start_time).total_seconds())
-    print(f"\n{'='*65}\n  ÖZET RAPOR\n{'='*65}")
-    print(f"  Toplam Seri       : {len(series_list)}")
-    print(f"  Başarılı          : {ok_count}")
-    print(f"  Lezyonlu Seri     : {sum(1 for r in results if r.get('has_lesion'))}")
-    print(f"  Geçen Süre        : {elapsed // 60}d {elapsed % 60}s")
-    print(f"  nnU-Net Raw Dizin : {nnunet_paths['dataset_dir']}\n{'='*65}\n")
+        elapsed = int((datetime.now() - start_time).total_seconds())
+        print(f"\n{'='*65}\n  ÖZET RAPOR\n{'='*65}")
+        print(f"  Toplam Seri       : {len(series_list)}")
+        print(f"  Başarılı          : {ok_count}")
+        print(f"  Lezyonlu Seri     : {sum(1 for r in results if r.get('has_lesion'))}")
+        print(f"  Geçen Süre        : {elapsed // 60}d {elapsed % 60}s")
+        print(f"  nnU-Net Raw Dizin : {nnunet_paths['dataset_dir']}\n{'='*65}\n")
 
 
 if __name__ == "__main__":

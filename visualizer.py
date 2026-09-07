@@ -42,16 +42,9 @@ def generate_lesion_visualization(
 
     ct_arr = sitk.GetArrayFromImage(sitk.ReadImage(ct_nifti_path))     # (Z, Y, X)
     mask_arr = sitk.GetArrayFromImage(sitk.ReadImage(mask_nifti_path)) # (Z, Y, X)
-
-    # Eğer belirtilen lezyon etiketi maskede yoksa alternatifleri kontrol et (2 veya 1)
-    unique_vals = set(np.unique(mask_arr))
-    if lesion_label_id not in unique_vals:
-        for alt_id in [2, 1]:
-            if alt_id in unique_vals:
-                lesion_label_id = alt_id
-                break
-
     # 1. En Uygun Aksiyel Kesiti (Z) Seç: SADECE Lezyon Voksellerini Say!
+    unique_vals = set(np.unique(mask_arr))
+    has_lesion = (lesion_label_id in unique_vals)
     lesion_counts_per_slice = np.sum(mask_arr == lesion_label_id, axis=(1, 2))
     
     if np.max(lesion_counts_per_slice) > 0:
@@ -158,15 +151,6 @@ def generate_longitudinal_comparison(
     bl_mask_arr = sitk.GetArrayFromImage(sitk.ReadImage(baseline_mask))
     fu_arr = sitk.GetArrayFromImage(sitk.ReadImage(followup_ct))
     fu_mask_arr = sitk.GetArrayFromImage(sitk.ReadImage(followup_mask))
-
-    # Etiket kontrolü
-    for arr in [bl_mask_arr, fu_mask_arr]:
-        unique_vals = set(np.unique(arr))
-        if lesion_label_id not in unique_vals:
-            for alt_id in [2, 1]:
-                if alt_id in unique_vals:
-                    lesion_label_id = alt_id
-                    break
 
     # SADECE Lezyon Voksellerini Sayarak Kesit Seç!
     bl_counts = np.sum(bl_mask_arr == lesion_label_id, axis=(1, 2))

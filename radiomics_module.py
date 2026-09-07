@@ -63,13 +63,16 @@ def analyze_ct_and_mask_radiomics(ct_nifti_path: str, mask_nifti_path: str, lesi
     spacing = ct_img.GetSpacing()              # (sx, sy, sz)
     voxel_vol = spacing[0] * spacing[1] * spacing[2]
 
-    # Eğer belirtilen etiket maskede yoksa alternatif etiketleri kontrol et
+    # Eğer belirtilen etiket maskede yoksa lezyon tespit edilmemiştir
     unique_vals = set(np.unique(mask_arr))
     if lesion_label_id not in unique_vals:
-        for alt_id in [2, 1]:
-            if alt_id in unique_vals:
-                lesion_label_id = alt_id
-                break
+        return {
+            "status": "success",
+            "total_candidate_regions": 0,
+            "regions": [],
+            "requires_radiologist_review": False,
+            "preview_image_path": ""
+        }
 
     lesion_binary = (mask_arr == lesion_label_id)
     labeled_mask, num_regions = ndimage.label(lesion_binary)
@@ -128,8 +131,19 @@ def analyze_ct_and_mask_radiomics(ct_nifti_path: str, mask_nifti_path: str, lesi
     # Görselleştirme preview (Varsa)
     try:
         from visualizer import generate_lesion_visualization
-        preview_png = mask_nifti_path.replace(".nii.gz", "_radiomics_preview.png")
-        generate_lesion_visualization(ct_nifti_path, mask_nifti_path, result, preview_png)
+        base_name = mask_nifti_path
+        for ext in [".nii.gz", ".nii"]:
+            if base_name.endswith(ext):
+                base_name = base_name[:-len(ext)]
+                break
+        preview_png = base_name + "_radiomics_preview.png"
+        generate_lesion_visualization(
+            ct_nifti_path=ct_nifti_path,
+            mask_nifti_path=mask_nifti_path,
+            radiomics_results=result,
+            output_png_path=preview_png,
+            lesion_label_id=lesion_label_id
+        )
         result["preview_image_path"] = preview_png
     except Exception:
         result["preview_image_path"] = ""

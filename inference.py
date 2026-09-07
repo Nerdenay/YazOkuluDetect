@@ -100,11 +100,17 @@ def run_segmentation_inference(
     # Önizleme 2D PNG görseli oluşturma (Varsa visualizer modülü)
     try:
         from visualizer import generate_lesion_visualization
-        preview_png = output_mask_path.replace(".nii.gz", "_preview.png")
+        base_name = output_mask_path
+        for ext in [".nii.gz", ".nii"]:
+            if base_name.endswith(ext):
+                base_name = base_name[:-len(ext)]
+                break
+        preview_png = base_name + "_preview.png"
         generate_lesion_visualization(
             ct_nifti_path=input_nifti_path,
             mask_nifti_path=output_mask_path,
-            output_png_path=preview_png
+            output_png_path=preview_png,
+            lesion_label_id=lesion_label_id
         )
         result["preview_image_path"] = preview_png
     except Exception:
@@ -150,13 +156,16 @@ def _calculate_mask_metrics(mask_path: str, lesion_label_id: int = 8) -> Dict[st
 
     voxel_vol = spacing[0] * spacing[1] * spacing[2]
 
-    # Eğer belirtilen lezyon etiketi maskede yoksa alternatifleri kontrol et (2 veya 1)
+    # Eğer belirtilen lezyon etiketi maskede yoksa lezyon tespit edilmemiştir
     unique_vals = set(np.unique(mask_arr))
     if lesion_label_id not in unique_vals:
-        for alt_id in [2, 1]:
-            if alt_id in unique_vals:
-                lesion_label_id = alt_id
-                break
+        return {
+            "detected_lesions_count": 0,
+            "total_volume_mm3": 0.0,
+            "primary_lesion_diameter_mm": 0.0,
+            "estimated_diameter_mm": 0.0,
+            "lesions": []
+        }
 
     binary_lesions = (mask_arr == lesion_label_id)
 

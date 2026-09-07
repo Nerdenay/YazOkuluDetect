@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Media;
@@ -90,11 +91,17 @@ namespace YazOkuluDetectUI
         /// <summary>Modeller klasöründe eğitilmiş ağırlık dosyası var mı kontrol eder ve AI modu rozetini günceller.</summary>
         private async Task CheckAiModeAsync()
         {
-            // Backend'e küçük bir istek atarak yanıt gövdesindeki bilgiye ulaşıyoruz.
-            // Alternatif: ./models klasörünü yerel olarak da kontrol edebiliriz.
-            string modelsDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "..", "..", "models");
-            bool hasWeights = Directory.Exists(modelsDir) &&
-                              Directory.GetFiles(modelsDir, "*.pth").Length > 0;
+            // ./models klasörünü farklı olası geliştirme/çalışma yollarında ara
+            string[] candidateDirs = new[]
+            {
+                Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "models"),
+                Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "models"),
+                Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "..", "models"),
+                Path.Combine(Directory.GetCurrentDirectory(), "models")
+            };
+            bool hasWeights = candidateDirs.Any(d => Directory.Exists(d) &&
+                              (Directory.GetFiles(d, "*.pth", SearchOption.AllDirectories).Length > 0 ||
+                               Directory.GetFiles(d, "*.pt", SearchOption.AllDirectories).Length > 0));
 
             await Dispatcher.InvokeAsync(() =>
             {
@@ -364,13 +371,13 @@ namespace YazOkuluDetectUI
                 string json = JsonConvert.SerializeObject(payload);
                 var content = new StringContent(json, Encoding.UTF8, "application/json");
 
-                // Uzun sürebileceği için progress güncelle
-                var progressTask = SimulateProgressAsync(15, 75, 6);
-                var apiTask = _httpClient.PostAsync($"{ApiBaseUrl}/pipeline", content);
+                // Uzun sürebileceği için progress güncelle (API tamamlandığında iptal edilir)
+                using var cts = new CancellationTokenSource();
+                var progressTask = SimulateProgressAsync(15, 85, 14, cts.Token);
+                var response = await _httpClient.PostAsync($"{ApiBaseUrl}/pipeline", content);
+                cts.Cancel();
+                try { await progressTask; } catch { }
 
-                await Task.WhenAll(progressTask, apiTask);
-
-                var response  = apiTask.Result;
                 string responseStr = await response.Content.ReadAsStringAsync();
 
                 if (!response.IsSuccessStatusCode)
@@ -393,13 +400,15 @@ namespace YazOkuluDetectUI
             }
         }
 
-        /// <summary>Progress bar'ı başlangıç değerinden bitiş değerine yavaşça ilerleten sahte animasyon görevidir.</summary>
-        private async Task SimulateProgressAsync(int from, int to, int steps)
+        /// <summary>Progress bar'ı başlangıç değerinden bitiş değerine ilerleten animasyon görevidir.</summary>
+        private async Task SimulateProgressAsync(int from, int to, int steps, CancellationToken ct = default)
         {
-            int step = (to - from) / steps;
+            int step = Math.Max(1, (to - from) / steps);
             for (int i = from; i < to; i += step)
             {
-                await Task.Delay(2000);
+                if (ct.IsCancellationRequested) break;
+                try { await Task.Delay(1000, ct); } catch { break; }
+                if (ct.IsCancellationRequested) break;
                 int current = Math.Min(i + step, to);
                 Dispatcher.Invoke(() => SetProgress(current, $"Analiz devam ediyor... (%{current})"));
             }
@@ -412,12 +421,14 @@ namespace YazOkuluDetectUI
         {
             try
             {
-                // Lezyon metrikleri
+                // Lezyon metrikleri (Hem flat hem nested anahtar desteği)
                 var singleResult = result["single_timepoint_result"] ?? result;
+                var seg = singleResult["segmentation"];
                 int lesionCount  = singleResult["lesion_count"]?.ToObject<int>() ??
-                                   singleResult["radiomics"]?["total_lesions"]?.ToObject<int>() ?? 0;
+                                   seg?["detected_lesions_count"]?.ToObject<int>() ??
+                                   singleResult["radiomics"]?["total_candidate_regions"]?.ToObject<int>() ?? 0;
                 double totalVol  = singleResult["total_volume_mm3"]?.ToObject<double>() ??
-                                   singleResult["radiomics"]?["total_volume_mm3"]?.ToObject<double>() ?? 0;
+                                   seg?["total_volume_mm3"]?.ToObject<double>() ?? 0;
                 double sod       = singleResult["sod_mm"]?.ToObject<double>() ??
                                    singleResult["radiomics"]?["sod_mm"]?.ToObject<double>() ?? 0;
 
@@ -442,7 +453,8 @@ namespace YazOkuluDetectUI
 
                 // Preview görsel
                 string previewPath = singleResult["preview_image_path"]?.ToString() ??
-                                     result["segmentation"]?["preview_image_path"]?.ToString() ?? "";
+                                     seg?["preview_image_path"]?.ToString() ??
+                                     singleResult["radiomics"]?["preview_image_path"]?.ToString() ?? "";
                 if (!string.IsNullOrEmpty(previewPath) && File.Exists(previewPath))
                     LoadImageToViewer(previewPath);
             }
@@ -472,7 +484,9 @@ namespace YazOkuluDetectUI
                 bool   newLesion   = recist["new_lesion"]?.ToObject<bool>() ?? false;
 
                 int lesionCount    = result["matching"]?["matched_lesions"]?.ToObject<int>() ??
-                                     result["segmentation_baseline"]?["detected_lesions_count"]?.ToObject<int>() ?? 0;
+                                     result["longitudinal"]?["matching"]?["matched_pairs"]?.Count() ??
+                                     result["segmentation"]?["followup"]?["detected_lesions_count"]?.ToObject<int>() ??
+                                     result["segmentation_followup"]?["detected_lesions_count"]?.ToObject<int>() ?? 0;
 
                 // Karar rozeti rengi ve başlık
                 TxtDecisionBadge.Text    = decision;
@@ -515,8 +529,11 @@ namespace YazOkuluDetectUI
                 TxtReportOutput.Text = report;
                 Log($"[KARAR] {decision} — SOD: {sodBl:F1}→{sodFu:F1} mm, Δ{changeSign}{changePct:F1}%");
 
-                // Preview görsel
-                string previewPath = result["segmentation_followup"]?["preview_image_path"]?.ToString() ??
+                // Preview görsel (Longitudinal yan yana veya followup önizlemesi)
+                string previewPath = result["preview_image_path"]?.ToString() ??
+                                     result["segmentation"]?["followup"]?["preview_image_path"]?.ToString() ??
+                                     result["segmentation_followup"]?["preview_image_path"]?.ToString() ??
+                                     result["segmentation"]?["baseline"]?["preview_image_path"]?.ToString() ??
                                      result["segmentation_baseline"]?["preview_image_path"]?.ToString() ?? "";
                 if (!string.IsNullOrEmpty(previewPath) && File.Exists(previewPath))
                     LoadImageToViewer(previewPath);

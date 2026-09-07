@@ -145,13 +145,10 @@ def extract_lesion_features(mask_path: str, lesion_label_id: int = 8) -> List[Di
     spacing = mask_img.GetSpacing()              # (sx, sy, sz)
     voxel_vol = spacing[0] * spacing[1] * spacing[2]
 
-    # Eğer belirtilen etiket maskede yoksa alternatif etiketleri kontrol et
+    # Eğer belirtilen etiket maskede yoksa lezyon tespit edilmemiştir
     unique_vals = set(np.unique(mask_arr))
     if lesion_label_id not in unique_vals:
-        for alt_id in [2, 1]:
-            if alt_id in unique_vals:
-                lesion_label_id = alt_id
-                break
+        return []
 
     binary_lesions = (mask_arr == lesion_label_id)
     labeled_mask, num_features = ndimage.label(binary_lesions)
@@ -263,7 +260,7 @@ def match_lesions_hungarian(baseline_lesions: List[Dict], followup_lesions: List
 
 def run_longitudinal_analysis(baseline_ct: str, baseline_mask: str,
                                followup_ct: str, followup_mask: str,
-                               output_dir: str) -> Dict[str, Any]:
+                               output_dir: str, lesion_label_id: int = 8) -> Dict[str, Any]:
     """
     Longitudinal takip sürecini eksiksiz yürütür ve RECIST 1.1 SOD değerlerini döndürür.
     """
@@ -279,10 +276,10 @@ def run_longitudinal_analysis(baseline_ct: str, baseline_mask: str,
     print("[2/4] Baseline maskesi transform ile taşınıyor...")
     warp_baseline_mask(baseline_mask, followup_ct, composite_transform, warped_mask_path)
 
-    # 3. Özellik Çıkarımı (Label 8: Lezyonlar, yoksa 2 veya 1)
-    print("[3/4] Lezyonlar ve RECIST çapları çıkarılıyor...")
-    bl_lesions = extract_lesion_features(warped_mask_path, lesion_label_id=8)
-    fu_lesions = extract_lesion_features(followup_mask, lesion_label_id=8)
+    # 3. Özellik Çıkarımı (Label 8: Malign Lezyonlar)
+    print(f"[3/4] Lezyonlar (Label {lesion_label_id}) ve RECIST çapları çıkarılıyor...")
+    bl_lesions = extract_lesion_features(warped_mask_path, lesion_label_id=lesion_label_id)
+    fu_lesions = extract_lesion_features(followup_mask, lesion_label_id=lesion_label_id)
 
     # 4. Eşleştirme
     print("[4/4] Hungarian eşleştirme uygulanıyor...")
