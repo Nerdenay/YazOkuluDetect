@@ -28,11 +28,11 @@ import nibabel as nib
 import gc
 import ctypes
 
+
 def force_ram_cleanup():
     """Python çöp toplayıcısını çalıştırır ve Linux çekirdeğine RAM'i zorla iade eder."""
     gc.collect()
     try:
-        # glibc heap belleğini Linux kernel'a geri verir
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:
         pass
@@ -42,6 +42,7 @@ def force_ram_cleanup():
             torch.cuda.empty_cache()
     except Exception:
         pass
+
 
 # ── Sistem modüllerini import et ─────────────────────────────────────────────
 try:
@@ -64,7 +65,7 @@ ORGAN_LABEL_MAP = {
     "liver": 1,
     "spleen": 2,
     "kidney_right": 3,
-    "kidney_left": 3,  # Sağ ve sol böbrek tek sınıf
+    "kidney_left": 3,
     "pancreas": 4,
     "gallbladder": 5,
     "stomach": 6,
@@ -75,10 +76,6 @@ ORGAN_LABEL_MAP = {
 # ── Yardımcı Fonksiyonlar ───────────────────────────────────────────────────
 
 def find_dicom_series_with_timepoints(root_dir: str) -> list:
-    """
-    Hastaları ve altındaki T0, T1 gibi zaman noktalarını hiyerarşik olarak bulur.
-    Dönüş formatı: [{'patient_num': 1, 'tp': 't0', 'case_id': 'hasta_001_t0', 'path': '...'}]
-    """
     root = Path(root_dir)
     selected_series = []
 
@@ -143,9 +140,6 @@ def find_dicom_series_with_timepoints(root_dir: str) -> list:
 
 
 def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True) -> bool:
-    """
-    TotalSegmentator alt işlemini RAM/VRAM taşmasını önleyen sınırlı worker ortamında çalıştırır.
-    """
     os.environ["TOTALSEG_DISABLE_MP"] = "1"
     os.environ["nnUNet_def_n_proc"] = "1"
 
@@ -168,14 +162,11 @@ def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True)
     cmd = [ts_bin if ts_bin else sys.executable, "-m", "totalsegmentator.bin.TotalSegmentator"] if not ts_bin else [ts_bin]
     cmd += ["-i", nifti_path, "-o", ts_output_dir] + roi_args
     cmd += ["--device", device_str]
-    # Multiprocessing ForkPoolWorker BrokenPipeError'ı tamamen engellemek için kaydetme ve resample iş parçacığını 1 yap
     cmd += ["--nr_thr_saving", "1", "--nr_thr_resamp", "1"]
     
-    # --fast parametresi voxel sayısını azaltarak RAM kullanımını %85 düşürür
     if fast:
         cmd.append("--fast")
 
-    # Colab RAM'ini korumak için worker ve thread sayılarını 1 ile sınırla
     custom_env = os.environ.copy()
     custom_env["OMP_NUM_THREADS"] = "1"
     custom_env["MKL_NUM_THREADS"] = "1"
@@ -185,7 +176,6 @@ def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True)
 
     ts_start = datetime.now()
     try:
-        # Çıktı doğrudan terminale akar; 64KB pipe buffer kilitlenmesi (deadlock) engellenir ve canlı ilerleme çubuğu görünür
         res = subprocess.run(
             cmd,
             env=custom_env,
@@ -197,26 +187,17 @@ def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True)
             return True
         else:
             print(f"    [TotalSegmentator] ⚠️ CLI tamamlanamadı (Return code: {res.returncode})")
-            # Eğer OOM (-9) olduysa Python API'yi notebook içinde çalıştırma (Kernel çöker!)
             if res.returncode == -9:
                 print("    [UYARI] ⚠️ Linux OOM Killer devreye girdi (RAM yetersizliği). Bellek temizleniyor...")
                 force_ram_cleanup()
-                return False
+            return False
     except Exception as e:
         print(f"    [TotalSegmentator] CLI alt işlem hatası: {e}")
         force_ram_cleanup()
         return False
 
-    return last_organ_file.exists() and last_organ_file.stat().st_size > 1000
-
-
-
 
 def merge_organ_and_lesion_labels(ts_output_dir: str, ref_nifti_path: str, manual_lesion_path: str, merged_mask_path: str) -> dict:
-    """
-    Organ maskelerini (1-7) ve varsa lezyon maskesini (8) birleştirir.
-    Geometri referansı olarak doğrudan orijinal nifti_path kullanılır.
-    """
     ts_dir = Path(ts_output_dir)
     stats = {
         "liver_voxels": 0, "spleen_voxels": 0, "kidney_voxels": 0,
@@ -255,7 +236,7 @@ def merge_organ_and_lesion_labels(ts_output_dir: str, ref_nifti_path: str, manua
         else:
             print(f"    [UYARI] ⚠️ Lezyon maskesi boyutu uyuşmuyor: {lesion_data.shape} vs {merged.shape}")
 
-    # Temiz uint8 başlık ve orijinal affine ile kaydet (scl_inter=-1024 kaymasını önler)
+    # ref_img.header bilerek eklenmez; temiz uint8 başlık ve orijinal affine korunur
     out_nii = nib.Nifti1Image(merged, ref_img.affine)
     out_nii.set_data_dtype(np.uint8)
     nib.save(out_nii, merged_mask_path)
@@ -269,7 +250,6 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
     start_time = datetime.now()
     output_path = Path(output_dir)
 
-    # Google Drive I/O kilidini engellemek için yerel hızlı SSD kullanımı
     local_temp = Path("/content/temp_work") if os.path.exists("/content") else output_path / "temp_work"
     nifti_dir = local_temp / "01_nifti"
     ts_masks_dir = local_temp / "02_ts_masks"
@@ -277,7 +257,6 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
     for d in [nifti_dir, ts_masks_dir, merged_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
-    # nnU-Net v2 çıktı yolları (Google Drive veya kalıcı disk)
     nnunet_paths = setup_nnunet_environment(str(output_path), dataset_id, dataset_name)
     images_tr = nnunet_paths["imagesTr"]
     labels_tr = nnunet_paths["labelsTr"]
@@ -294,8 +273,7 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
     print(f"  Manuel Lezyonlar   : {manual_lesions_dir if manual_lesions_dir else 'Belirtilmedi (Sadece organlar)'}")
     print(f"  Nihai Hedef        : {nnunet_paths['dataset_dir']}")
     if not has_cuda:
-        print("  ⚠️ UYARI: Colab GPU aktif değil! TotalSegmentator CPU modunda")
-        print("           hasta başına 15-20 dakika sürer! Lütfen menüden T4 GPU seçin.")
+        print("  ⚠️ UYARI: Colab GPU aktif değil! Lütfen menüden T4 GPU seçin.")
     print(f"{'='*65}\n")
 
     series_list = find_dicom_series_with_timepoints(dicom_root)
@@ -308,7 +286,16 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
         final_img = Path(images_tr) / f"{case_id}_0000.nii.gz"
         final_lbl = Path(labels_tr) / f"{case_id}.nii.gz"
 
-        if final_img.exists() and final_lbl.exists() and final_img.stat().st_size > 1000 and final_lbl.stat().st_size > 1000:
+        # Drive FUSE kopmalarına karşı korumalı Resume kontrolü
+        already_completed = False
+        try:
+            if final_img.is_file() and final_lbl.is_file():
+                if final_img.stat().st_size > 1000 and final_lbl.stat().st_size > 1000:
+                    already_completed = True
+        except OSError:
+            already_completed = False
+
+        if already_completed:
             print(f"    [RESUME] ✅ {case_id} tamamlanmış, atlanıyor.\n")
             results.append({"id": case_id, "status": "TAMAMLANDI", "source": item["path"]})
             continue
@@ -318,8 +305,6 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
         # 1. DICOM → NIfTI
         nifti_out = str(nifti_dir / f"{case_id}.nii.gz")
         try:
-            # Eğer Drive'da imagesTr içinde NIfTI görüntüsü zaten varsa (önceki yarıda kalmış denemeden),
-            # 600 DICOM dosyasını ağdan okumak yerine direkt Drive'daki NIfTI'ı kopyala (2-3 dk kazandırır)
             if final_img.exists() and final_img.stat().st_size > 1000:
                 print(f"    [1/4] ⚡ NIfTI görüntüsü Drive imagesTr'de mevcut, doğrudan alınıyor...")
                 if not (os.path.exists(nifti_out) and os.path.getsize(nifti_out) > 1000):
@@ -346,6 +331,12 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
         if not ts_ok:
             print(f"    [2/4] ❌ TotalSegmentator organ maskeleri üretilemedi.\n")
             results.append({"id": case_id, "status": "HATA", "adim": "TotalSegmentator"})
+            # Başarısız olsa dahi diski temizle ve belleği sıfırla
+            if os.path.exists(ts_case_dir):
+                shutil.rmtree(ts_case_dir, ignore_errors=True)
+            if os.path.exists(nifti_out):
+                os.remove(nifti_out)
+            force_ram_cleanup()
             continue
         print(f"    [2/4] ✅ TotalSegmentator organ maskeleri hazır")
 
@@ -378,7 +369,7 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
             print(f"    [4/4] ❌ Dosya aktarım hatası: {copy_err}\n")
             results.append({"id": case_id, "status": "HATA", "adim": "Kopyalama"})
 
-        # 5. DISK TEMİZLİĞİ: Yerel SSD'de biriken 8 organ maskesini ve ham NIfTI'yi sil (Colab disk dolmasını önler)
+        # 5. DISK TEMİZLİĞİ: Yerel SSD'de biriken maskeleri ve ham NIfTI'yi sil (80GB diskin dolmasını önler)
         if os.path.exists(ts_case_dir):
             shutil.rmtree(ts_case_dir, ignore_errors=True)
         if os.path.exists(merged_label_path):
@@ -386,23 +377,16 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
         if os.path.exists(nifti_out):
             os.remove(nifti_out)
 
-        # 6. Bellek Temizliği (Linux glibc malloc_trim + PyTorch CUDA)
+        # 6. Bellek Temizliği
         if 'stats' in locals():
             del stats
         force_ram_cleanup()
 
-
-    # dataset.json Üretimi (HepaRECIST-AI 8 Sınıflı Standart Şema)
+    # dataset.json Üretimi
     ok_count = sum(1 for r in results if r["status"] in ["OK", "TAMAMLANDI"])
     labels_dict = {
-        "background": 0,
-        "liver": 1,
-        "spleen": 2,
-        "kidneys": 3,
-        "pancreas": 4,
-        "gallbladder": 5,
-        "stomach": 6,
-        "aorta": 7,
+        "background": 0, "liver": 1, "spleen": 2, "kidneys": 3,
+        "pancreas": 4, "gallbladder": 5, "stomach": 6, "aorta": 7,
         "lesion": 8
     }
 
@@ -420,8 +404,6 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
     print(f"  Geçen Süre        : {elapsed // 60}d {elapsed % 60}s")
     print(f"  nnU-Net Raw Dizin : {nnunet_paths['dataset_dir']}\n{'='*65}\n")
 
-
-# ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="HepaRECIST-AI Veri Seti Hazırlama")
