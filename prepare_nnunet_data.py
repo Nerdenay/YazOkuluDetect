@@ -11,7 +11,7 @@ import os
 import sys
 import shutil
 import json
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
 
 def setup_nnunet_environment(base_dir: str, dataset_id: int = 1, dataset_name: str = "AbdominalTumor") -> Dict[str, str]:
@@ -146,12 +146,20 @@ export nnUNet_results="{os.path.join(base_dir, 'nnUNet_results')}"
 
 echo "=== nnU-Net v2 Bulut Eğitim Boru Hattı Başlatılıyor ==="
 echo "nnUNet_raw: $nnUNet_raw"
-echo "nnUNet_preprocessed: $nnUN_preprocessed"
+echo "nnUNet_preprocessed: $nnUNet_preprocessed"
 echo "nnUNet_results: $nnUNet_results"
 
 # 1. Otomatik Planlama ve Ön İşleme (Fingerprint & Preprocessing)
 echo "--> Adım 1: Otomatik Planlama & Preprocessing (Dataset {dataset_id:03d})..."
 nnUNetv2_plan_and_preprocess -d {dataset_id} --verify_dataset_integrity
+
+# Hasta düzeyinde katlar: nnU-Net'in vaka düzeyindeki rastgele bölmesi yerine
+# (aynı hastanın t0/t1 serileri aynı katta kalır)
+DS_NAME=$(basename $(ls -d "$nnUNet_raw"/Dataset{dataset_id:03d}_*))
+if [ -f "$nnUNet_raw/$DS_NAME/splits_final.json" ]; then
+  cp "$nnUNet_raw/$DS_NAME/splits_final.json" "$nnUNet_preprocessed/$DS_NAME/splits_final.json"
+  echo "--> Hasta düzeyinde splits_final.json kopyalandı."
+fi
 
 # 2. 3D Full Resolution Eğitimi Başlat (5-Fold Cross Validation)
 echo "--> Adım 2: 3D Full Resolution Eğitimi Başlatılıyor..."
@@ -172,3 +180,73 @@ if __name__ == "__main__":
     target_base = os.path.abspath("./nnunet_data")
     env_paths = setup_nnunet_environment(target_base, dataset_id=1, dataset_name="AbdominalTumor")
     generate_cloud_training_script(env_paths)
+
+
+def _patient_key(case_id: str) -> str:
+    """'hasta_012_t1' -> 'hasta_012' (zaman noktası soneki atılır)."""
+    parts = case_id.split("_")
+    if len(parts) >= 3 and parts[-1].lower().startswith("t"):
+        return "_".join(parts[:-1])
+    return case_id
+
+
+def make_patient_level_splits(nnunet_paths: Dict[str, str], case_ids, n_folds: int = 5,
+                              test_fraction: float = 0.2, seed: int = 42) -> Dict[str, Any]:
+    """
+    Hasta düzeyinde bölme:
+      1. Hastaların test_fraction kadarı ayrı test setine ayrılır; serileri
+         imagesTr/labelsTr'den imagesTs/labelsTs'ye taşınır (eğitimde hiç görülmez).
+      2. Kalan hastalar n_folds kata bölünür; splits_final.json yazılır
+         (nnU-Net v2 formatı: [{"train": [...], "val": [...]}, ...]).
+    """
+    import json
+    import random
+    import shutil as _sh
+
+    groups: Dict[str, List[str]] = {}
+    for cid in case_ids:
+        groups.setdefault(_patient_key(cid), []).append(cid)
+    patients = sorted(groups)
+    rng = random.Random(seed)
+    rng.shuffle(patients)
+
+    n_test = int(round(len(patients) * test_fraction)) if len(patients) > n_folds else 0
+    test_patients = sorted(patients[:n_test])
+    train_patients = patients[n_test:]
+
+    raw = nnunet_paths["dataset_dir"]
+    labels_ts = os.path.join(raw, "labelsTs")
+    os.makedirs(labels_ts, exist_ok=True)
+    test_cases = []
+    for p in test_patients:
+        for cid in groups[p]:
+            for src_dir, dst_dir, name in (
+                (nnunet_paths["imagesTr"], nnunet_paths["imagesTs"], f"{cid}_0000.nii.gz"),
+                (nnunet_paths["labelsTr"], labels_ts, f"{cid}.nii.gz"),
+            ):
+                src = os.path.join(src_dir, name)
+                if os.path.exists(src):
+                    _sh.move(src, os.path.join(dst_dir, name))
+            test_cases.append(cid)
+
+    k = max(1, min(n_folds, len(train_patients)))
+    folds = [train_patients[i::k] for i in range(k)]
+    splits = []
+    for i in range(k):
+        val = sorted(c for p in folds[i] for c in groups[p])
+        train = sorted(c for j in range(k) if j != i for p in folds[j] for c in groups[p])
+        splits.append({"train": train, "val": val})
+
+    with open(os.path.join(raw, "splits_final.json"), "w", encoding="utf-8") as f:
+        json.dump(splits, f, indent=2)
+    with open(os.path.join(raw, "patient_split.json"), "w", encoding="utf-8") as f:
+        json.dump({"seed": seed, "test_patients": test_patients,
+                   "train_patients": sorted(train_patients)}, f, indent=2, ensure_ascii=False)
+    pre = os.path.join(nnunet_paths["preprocessed"], nnunet_paths["dataset_name"])
+    os.makedirs(pre, exist_ok=True)
+    _sh.copy2(os.path.join(raw, "splits_final.json"), os.path.join(pre, "splits_final.json"))
+
+    train_cases = sorted(c for p in train_patients for c in groups[p])
+    print(f"[INFO] Hasta düzeyinde bölme: {len(train_patients)} eğitim / {len(test_patients)} test hastası, {k} kat.")
+    return {"train_cases": train_cases, "test_cases": sorted(test_cases),
+            "test_patients": test_patients, "splits": splits}

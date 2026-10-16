@@ -6,10 +6,12 @@ HepaRECIST-AI: Uçtan Uca 4D Longitudinal Analiz & RECIST 1.1 Karar Destek Boru 
 Tek bir çağrıyla tüm analiz sürecini yönetir:
   DICOM (t0 + t1) 
     → Preprocessing (1.0 mm³ Ham HU İzotropik Resampling)
-    → AI Multi-Organ & Lezyon Segmentasyonu (nnU-Net v2 / Güvenli Mock, Label 8)
-    → Radiomics Doku Doğrulama & Sphericity (Malign / Benign / Vasküler)
-    → 4D Longitudinal B-Spline Registration & Hungarian Eşleştirme
-    → RECIST 1.1 Deterministik Karar Motoru (Nadir ve Yeni Lezyon Korumalı)
+    → AI Multi-Organ & Lezyon Segmentasyonu (nnU-Net v2, Label 8; model yoksa hata)
+    → Dansite ön-kategorileri ve küresellik (tanı değildir)
+    → Boylamsal kayıt (yalnızca konum), doğal uzayda ölçüm, Macar eşleştirme,
+      kayıt kalite kontrolü ve aday yeni lezyon doğrulaması
+    → RECIST 1.1 karar motoru (recist_engine.py; nadir destekli, aday yeni lezyon
+      otomatik PD yapılmaz)
     → Klinik Rapor Üretimi (Düzce Üniversitesi Formatı / LLM)
 """
 
@@ -17,12 +19,23 @@ import os
 from datetime import datetime
 from typing import Dict, Any, Optional
 
+import SimpleITK as sitk
+
 # Proje Alt Modülleri
 from preprocess import convert_dicom_to_nifti, resample_image
 from inference import run_segmentation_inference
 from radiomics_module import analyze_ct_and_mask_radiomics
 from matching_engine import run_longitudinal_analysis
 from report_generator import generate_clinical_report
+from recist_engine import evaluate_recist
+
+
+def _original_slice_thickness(nifti_path: str) -> float:
+    """Yeniden örneklemeden ÖNCEKİ z aralığı (RECIST ölçülebilirlik eşiği için)."""
+    reader = sitk.ImageFileReader()
+    reader.SetFileName(nifti_path)
+    reader.ReadImageInformation()
+    return round(float(reader.GetSpacing()[2]), 3)
 
 
 def run_full_pipeline(baseline_dicom_dir: str, followup_dicom_dir: str,
@@ -31,9 +44,16 @@ def run_full_pipeline(baseline_dicom_dir: str, followup_dicom_dir: str,
                        patient_info: Optional[Dict[str, str]] = None,
                        lesion_label_id: int = 8,
                        use_llm: bool = False,
-                       llm_api_key: Optional[str] = None) -> Dict[str, Any]:
+                       llm_api_key: Optional[str] = None,
+                       sod_nadir: Optional[float] = None,
+                       new_lesion_confirmed: bool = False,
+                       allow_mock: Optional[bool] = None) -> Dict[str, Any]:
     """
     İki zaman noktalı (t0 ve t1) uçtan uca analiz boru hattı.
+
+    sod_nadir            : önceki takiplerde ölçülen en küçük hedef SOD (varsa)
+    new_lesion_confirmed : radyolog yeni lezyonu onayladıysa True (yeniden çalıştırma)
+    allow_mock           : yalnızca test; gerçek veride False bırakın
     """
     print("=" * 70)
     print(" 🚀 HepaRECIST-AI: UÇTAN UCA LONGİTUDİNAL ANALİZ BORU HATTI")
@@ -67,6 +87,7 @@ def run_full_pipeline(baseline_dicom_dir: str, followup_dicom_dir: str,
     bl_final = os.path.join(preprocess_dir, "baseline.nii.gz")
     
     convert_dicom_to_nifti(baseline_dicom_dir, preprocess_dir, "tmp_raw_baseline.nii.gz")
+    bl_thickness = _original_slice_thickness(bl_tmp_raw)
     resample_image(bl_tmp_raw, bl_final, new_spacing=(1.0, 1.0, 1.0), is_label=False)
     if os.path.exists(bl_tmp_raw):
         os.remove(bl_tmp_raw)
@@ -77,15 +98,18 @@ def run_full_pipeline(baseline_dicom_dir: str, followup_dicom_dir: str,
     fu_final = os.path.join(preprocess_dir, "followup.nii.gz")
     
     convert_dicom_to_nifti(followup_dicom_dir, preprocess_dir, "tmp_raw_followup.nii.gz")
+    fu_thickness = _original_slice_thickness(fu_tmp_raw)
     resample_image(fu_tmp_raw, fu_final, new_spacing=(1.0, 1.0, 1.0), is_label=False)
     if os.path.exists(fu_tmp_raw):
         os.remove(fu_tmp_raw)
 
     results["preprocessing"] = {
         "baseline_nifti": bl_final,
-        "followup_nifti": fu_final
+        "followup_nifti": fu_final,
+        "baseline_slice_thickness_mm": bl_thickness,
+        "followup_slice_thickness_mm": fu_thickness,
     }
-    print("  [✓] Ön işleme tamamlandı (Ham HU değerleri korundu).")
+    print(f"  [✓] Ön işleme tamamlandı (kesit kalınlığı t0: {bl_thickness} mm, t1: {fu_thickness} mm).")
 
     # =========================================================================
     # ADIM 2: AI SEGMENTASYON (Multi-Organ + Label 8 Lezyon)
@@ -98,14 +122,16 @@ def run_full_pipeline(baseline_dicom_dir: str, followup_dicom_dir: str,
     fu_mask = os.path.join(masks_dir, "followup_mask.nii.gz")
 
     print("  [t0] Baseline segmentasyonu...")
-    bl_seg = run_segmentation_inference(bl_final, bl_mask, model_dir, lesion_label_id=lesion_label_id)
+    bl_seg = run_segmentation_inference(bl_final, bl_mask, model_dir, lesion_label_id=lesion_label_id,
+                                        allow_mock=allow_mock, slice_thickness_mm=bl_thickness)
     print("  [t1] Follow-up segmentasyonu...")
-    fu_seg = run_segmentation_inference(fu_final, fu_mask, model_dir, lesion_label_id=lesion_label_id)
+    fu_seg = run_segmentation_inference(fu_final, fu_mask, model_dir, lesion_label_id=lesion_label_id,
+                                        allow_mock=allow_mock, slice_thickness_mm=fu_thickness)
 
     results["segmentation"] = {
         "baseline": bl_seg,
         "followup": fu_seg,
-        "is_mock": bl_seg["is_mock"]
+        "is_mock": bool(bl_seg["is_mock"] or fu_seg["is_mock"])
     }
     print(f"  [✓] Segmentasyon tamamlandı (Mock Modu: {bl_seg['is_mock']}).")
 
@@ -146,7 +172,9 @@ def run_full_pipeline(baseline_dicom_dir: str, followup_dicom_dir: str,
         followup_ct=fu_final,
         followup_mask=fu_mask,
         output_dir=longitudinal_dir,
-        lesion_label_id=lesion_label_id
+        lesion_label_id=lesion_label_id,
+        baseline_slice_thickness_mm=bl_thickness,
+        followup_slice_thickness_mm=fu_thickness,
     )
 
     # 4D Longitudinal Yan Yana Karşılaştırma Görselini Üret
@@ -176,49 +204,28 @@ def run_full_pipeline(baseline_dicom_dir: str, followup_dicom_dir: str,
     print("[ADIM 5/6] RECIST 1.1 Karar Motoru: Matematiksel Değerlendirme...")
     print(f"{'─' * 70}")
 
-    # Sözlük anahtarı uyumluluğu (recist_metrics veya recist_input)
-    recist_data = longitudinal_result.get("recist_metrics", longitudinal_result.get("recist_input", {}))
-    sod_bl = recist_data.get("sod_baseline", 0.0)
-    sod_fu = recist_data.get("sod_followup", 0.0)
-    has_new = recist_data.get("has_new_lesions", recist_data.get("new_lesion", False))
+    recist_data = longitudinal_result["recist_metrics"]
+    sod_bl = recist_data["sod_baseline"]
+    sod_fu = recist_data["sod_followup"]
+    n_cand = recist_data.get("new_lesion_candidates", 0)
 
-    # RECIST 1.1 Kuralları (Eisenhauer et al., 2009)
-    change_pct = ((sod_fu - sod_bl) / sod_bl * 100) if sod_bl > 0 else 0.0
-
-    if has_new:
-        decision = "PD"
-        reason = "Yeni lezyon tespit edildi. Kesin Progresif Hastalık (PD)."
-    elif sod_bl == 0.0 and sod_fu > 0.0:
-        decision = "PD"
-        reason = f"Başlangıçta hedef lezyon yokken takipte yeni lezyon yükü (+{sod_fu:.1f} mm) tespit edildi (PD)."
-    elif sod_bl == 0.0 and sod_fu == 0.0:
-        decision = "CR"
-        reason = "Başlangıç ve takip tetkiklerinde hedef lezyon saptanmamıştır (Tam Yanıt / Lezyonsuz)."
-    elif change_pct >= 20.0 and (sod_fu - sod_bl) >= 5.0:
-        decision = "PD"
-        reason = f"Tümör yükünde en az %20 ve mutlak en az 5mm artış tespit edildi (Değişim: %{change_pct:.1f})."
-    elif sod_bl > 0 and sod_fu == 0.0:
-        decision = "CR"
-        reason = "Hedeflenen tüm lezyonlar tamamen kayboldu (Tam Yanıt - CR)."
-    elif change_pct <= -30.0:
-        decision = "PR"
-        reason = f"Tümör yükünde en az %30 azalma tespit edildi (Değişim: %{change_pct:.1f})."
-    else:
-        decision = "SD"
-        reason = f"Belirgin küçülme veya progresyon kriteri karşılanmadı. Stabil durum (SD). (Değişim: %{change_pct:.1f})"
-
-    results["recist_decision"] = {
-        "baseline_sod": round(sod_bl, 2),
-        "followup_sod": round(sod_fu, 2),
-        "change_percentage": round(change_pct, 2),
-        "new_lesion": has_new,
-        "decision": decision,
-        "explanation": reason
-    }
+    rd = evaluate_recist(sod_bl, sod_fu, sod_nadir=sod_nadir,
+                         new_lesion_confirmed=new_lesion_confirmed,
+                         new_lesion_candidates=n_cand)
+    if longitudinal_result.get("registration_qc", {}).get("reliable") is False:
+        rd["explanation"] += " UYARI: Kayıt kalitesi düşük; eşleştirme sonuçları güvenilmez olabilir."
+    rd["requires_radiologist_review"] = bool(
+        longitudinal_result.get("requires_radiologist_review") or rd["provisional"])
+    results["recist_decision"] = rd
+    decision = rd["decision"]
+    change_pct = rd["change_from_baseline_pct"]
+    has_new = rd["new_lesion"]
 
     print(f"  KLİNİK KARAR : {decision}")
     print(f"  SOD DEĞİŞİMİ : {sod_bl:.1f} mm → {sod_fu:.1f} mm ({change_pct:+.1f}%)")
-    print(f"  YENİ LEZYON  : {'EVET (PD)' if has_new else 'HAYIR'}")
+    print(f"  YENİ LEZYON  : {'EVET (onaylı)' if has_new else 'HAYIR'} | Aday: {n_cand}")
+    if rd["provisional"]:
+        print("  ⚠️  Karar GEÇİCİ: aday yeni lezyon radyolog onayı bekliyor.")
     print("  [✓] RECIST 1.1 karar motoru sonuçlandı.")
 
     # =========================================================================
@@ -231,7 +238,7 @@ def run_full_pipeline(baseline_dicom_dir: str, followup_dicom_dir: str,
     report_input = {
         "segmentation": {
             "detected_lesions_count": fu_seg.get("detected_lesions_count", 0),
-            "is_mock": fu_seg.get("is_mock", True)
+            "is_mock": results["segmentation"]["is_mock"]
         },
         "radiomics": fu_radiomics,
         "longitudinal": longitudinal_result,
@@ -257,8 +264,10 @@ def run_full_pipeline(baseline_dicom_dir: str, followup_dicom_dir: str,
         "sod_baseline": round(sod_bl, 2),
         "sod_followup": round(sod_fu, 2),
         "change_percentage": round(change_pct, 2),
-        "has_new_lesions": has_new
+        "has_new_lesions": has_new,
+        "new_lesion_candidates": n_cand,
     }
+    results["requires_radiologist_review"] = rd["requires_radiologist_review"]
 
     # Raporu diske yaz
     timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -285,7 +294,8 @@ def run_single_timepoint_pipeline(dicom_dir: str,
                                     output_dir: str = "./output",
                                     model_dir: str = "./models",
                                     lesion_label_id: int = 8,
-                                    patient_info: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+                                    patient_info: Optional[Dict[str, str]] = None,
+                                    allow_mock: Optional[bool] = None) -> Dict[str, Any]:
     """
     Tek zamanlı (tek BT çekimi) analiz boru hattı.
     """
@@ -304,6 +314,7 @@ def run_single_timepoint_pipeline(dicom_dir: str,
     final_ct = os.path.join(preprocess_dir, "study.nii.gz")
     
     convert_dicom_to_nifti(dicom_dir, preprocess_dir, "tmp_single_raw.nii.gz")
+    thickness = _original_slice_thickness(tmp_raw)
     resample_image(tmp_raw, final_ct, new_spacing=(1.0, 1.0, 1.0), is_label=False)
     if os.path.exists(tmp_raw):
         os.remove(tmp_raw)
@@ -311,7 +322,8 @@ def run_single_timepoint_pipeline(dicom_dir: str,
     # 2. Segmentasyon
     print("\n[ADIM 2/3] AI Segmentasyon...")
     mask_path = os.path.join(masks_dir, "study_mask.nii.gz")
-    seg_result = run_segmentation_inference(final_ct, mask_path, model_dir, lesion_label_id=lesion_label_id)
+    seg_result = run_segmentation_inference(final_ct, mask_path, model_dir, lesion_label_id=lesion_label_id,
+                                            allow_mock=allow_mock, slice_thickness_mm=thickness)
 
     # 3. Radyomik
     print("\n[ADIM 3/3] Radyomik Doku Analizi...")
@@ -319,7 +331,11 @@ def run_single_timepoint_pipeline(dicom_dir: str,
 
     lesion_count = seg_result.get("detected_lesions_count", 0)
     total_vol = seg_result.get("total_volume_mm3", 0.0)
-    sod_val = seg_result.get("primary_lesion_diameter_mm", 0.0)
+    # Bazal hedef lezyon SOD'si (organ başına <= 2, toplam <= 5, ölçülebilir)
+    from lesion_geometry import extract_lesions, select_target_lesions
+    _lesions, _ = extract_lesions(sitk.ReadImage(mask_path), lesion_label_id, thickness)
+    targets = select_target_lesions(_lesions)
+    sod_val = round(sum(t["diameter_mm"] for t in targets), 2)
     preview_png = seg_result.get("preview_image_path", "")
 
     # 4. Klinik Rapor Üretimi (Tekil Tetkik)
@@ -329,8 +345,12 @@ def run_single_timepoint_pipeline(dicom_dir: str,
         "segmentation": seg_result,
         "radiomics": radiomics_result,
         "longitudinal": {
-            "baseline_targets": lesion_count,
+            "baseline_targets": len(targets),
             "followup_lesions": lesion_count,
+            "target_lesions": [{"baseline_id": t["id"], "organ": t["organ"],
+                                "baseline_diameter": t["diameter_mm"],
+                                "followup_diameter": t["diameter_mm"], "status": "matched"}
+                               for t in targets],
             "recist_metrics": {
                 "sod_baseline": sod_val,
                 "sod_followup": sod_val,
@@ -344,7 +364,7 @@ def run_single_timepoint_pipeline(dicom_dir: str,
             "change_percentage": 0.0,
             "new_lesion": False,
             "decision": "BL",
-            "explanation": f"Tekil / Başlangıç tetkiki: {lesion_count} lezyon odağı tespit edildi (SOD: {sod_val:.1f} mm)."
+            "explanation": f"Tekil / bazal tetkik: {lesion_count} lezyon odağı, {len(targets)} hedef lezyon (SOD: {sod_val:.1f} mm)."
         }
     }
     report_result = generate_clinical_report(
@@ -370,6 +390,8 @@ def run_single_timepoint_pipeline(dicom_dir: str,
         "lesion_count": lesion_count,
         "total_volume_mm3": total_vol,
         "sod_mm": sod_val,
+        "slice_thickness_mm": thickness,
+        "target_lesions": [{"id": t["id"], "organ": t["organ"], "diameter_mm": t["diameter_mm"]} for t in targets],
         "preview_image_path": preview_png,
         "note": "RECIST 1.1 tedavi yanıtı için en az iki zamanlı (t0, t1) çekim gereklidir."
     }

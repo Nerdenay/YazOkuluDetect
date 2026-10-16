@@ -89,30 +89,27 @@ def generate_lesion_visualization(
         if regions:
             for r in regions:
                 label = r.get("classification", "Lezyon")
-                conf_pct = r.get("confidence_score", 0.0) * 100
                 hu_mean = r.get("hu_mean", 0.0)
                 psi = r.get("sphericity_psi", 0.0)
                 needs_review = r.get("needs_review", False)
 
-                if "Benign" in label:
-                    badge_color = "#3B82F6"   # Mavi (Kist)
-                elif "Vasküler" in label:
-                    badge_color = "#EAB308"   # Sarı (Damar / Kalsifikasyon)
-                elif needs_review:
-                    badge_color = "#F97316"   # Turuncu (Hekim Onayı)
+                if "kistik" in label:
+                    badge_color = "#3B82F6"   # Mavi
+                elif "hiperdens" in label:
+                    badge_color = "#EAB308"   # Sarı
                 else:
-                    badge_color = "#EF4444"   # Kırmızı (Malign)
+                    badge_color = "#F97316"   # Turuncu (radyolog onayı)
 
                 y_pos = 35 + r.get("region_id", 1) * 32
                 ax.text(
                     12, y_pos,
-                    f"• Odak #{r.get('region_id')}: {label} (%{conf_pct:.0f}) | {hu_mean:.1f} HU | Ψ={psi:.2f}",
+                    f"• Odak #{r.get('region_id')}: {label} | {hu_mean:.1f} HU | Ψ={psi:.2f}",
                     color=badge_color, fontsize=9, fontweight='bold',
                     bbox=dict(boxstyle="round,pad=0.35", facecolor="#0F172A", edgecolor=badge_color, alpha=0.88)
                 )
         else:
             ax.text(
-                12, 35, "• AI Tespit Edilen Malign Lezyon Odağı",
+                12, 35, "• AI aday lezyon odağı (radyolog onayı gerekli)",
                 color="#EF4444", fontsize=10, fontweight='bold',
                 bbox=dict(boxstyle="round,pad=0.35", facecolor="#0F172A", edgecolor="#EF4444", alpha=0.88)
             )
@@ -190,12 +187,19 @@ def generate_longitudinal_comparison(
     sod_bl = recist.get("sod_baseline", 0.0)
     sod_fu = recist.get("sod_followup", 0.0)
     has_new = recist.get("has_new_lesions", recist.get("new_lesion", False))
+    n_cand = recist.get("new_lesion_candidates", 0)
     change_pct = recist.get("sod_change_pct", 0.0)
 
+    if has_new:
+        new_txt = "Yeni Lezyon: EVET (onaylı)"
+    elif n_cand:
+        new_txt = f"Aday Yeni Lezyon: {n_cand} (onay bekliyor)"
+    else:
+        new_txt = "Yeni Lezyon: YOK"
     fig.suptitle(
         f"4D LONGİTUDİNAL HİBRİT LEZYON TAKİBİ (RECIST 1.1)\n"
         f"Bazal SOD: {sod_bl:.1f} mm  ➔  Takip SOD: {sod_fu:.1f} mm ({'+' if change_pct >= 0 else ''}{change_pct:.1f}%)  |  "
-        f"Yeni Lezyon: {'EVET ⚠ (PD)' if has_new else 'YOK'}",
+        f"{new_txt}",
         fontsize=13, color='#F1F5F9', fontweight='bold', y=0.98
     )
 

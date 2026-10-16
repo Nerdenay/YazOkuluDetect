@@ -520,6 +520,29 @@ namespace YazOkuluDetectUI
                         TxtDecisionTitle.Text    = "Progressive Disease (İlerleme) ⚠️";
                         TxtChangeSummary.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#F87171"));
                         break;
+                    case "NE":
+                        BadgeDecision.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#374151"));
+                        TxtDecisionTitle.Text    = "Not Evaluable (Değerlendirilemedi) ❓";
+                        TxtChangeSummary.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#9CA3AF"));
+                        break;
+                    default:
+                        BadgeDecision.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1E3A5F"));
+                        TxtDecisionTitle.Text    = $"{decision}";
+                        TxtChangeSummary.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#38BDF8"));
+                        break;
+                }
+
+                bool requiresReview = recist["requires_radiologist_review"]?.ToObject<bool>() ??
+                                      result["report"]?["requires_radiologist_review"]?.ToObject<bool>() ?? false;
+                bool provisional    = recist["provisional"]?.ToObject<bool>() ?? false;
+
+                if (provisional)
+                {
+                    TxtDecisionTitle.Text += " [Geçici Karar]";
+                }
+                if (requiresReview)
+                {
+                    TxtDecisionExplanation.Text = "⚠️ [Radyolog İncelemesi Gerekli] " + TxtDecisionExplanation.Text;
                 }
 
                 // Rapor

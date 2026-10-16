@@ -4,7 +4,9 @@ inference.py
 HepaRECIST-AI - Faz 2: nnU-Net v2 Çok Sınıflı Batın Segmentasyon Çıkarım Motoru
 - 8-Sınıflı Batın Organları + Lezyon (Label 8) Tahmini
 - Eğitilmiş model varsa gerçek nnU-Net v2 Sliding-Window çıkarımı
-- Ağırlık yoksa veya GPU yetersizse pipeline'ı bozmayan Güvenli Mock Modu
+- Model yoksa veya çıkarım başarısızsa HATA verir (sahte lezyon üretmez).
+  Test amaçlı sahte maske yalnızca allow_mock=True ya da HEPARECIST_ALLOW_MOCK=1
+  ile açıkça istenirse üretilir ve sonuçta is_mock=True olarak işaretlenir.
 - nnU-Net v2 truncated dosya isimlendirmesi ve RAM/VRAM dengeli tahmin mimarisi
 """
 
@@ -12,8 +14,13 @@ import os
 import sys
 import numpy as np
 import SimpleITK as sitk
-from scipy import ndimage
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+
+from lesion_geometry import extract_lesions
+
+
+class ModelUnavailableError(RuntimeError):
+    """Gerçek model çıkarımı yapılamadığında fırlatılır (sahte sonuç üretilmez)."""
 
 
 # ── ANA ÇIKARIM FONKSİYONU ───────────────────────────────────────────────────
@@ -22,12 +29,16 @@ def run_segmentation_inference(
     input_nifti_path: str,
     output_mask_path: str,
     model_dir: str = "./models",
-    lesion_label_id: int = 8
+    lesion_label_id: int = 8,
+    allow_mock: Optional[bool] = None,
+    slice_thickness_mm: Optional[float] = None
 ) -> Dict[str, Any]:
     """
     nnU-Net v2 ile 3D çok sınıflı batın segmentasyonu çıkarımı yapar.
-    Ağırlıklar yoksa otomatik olarak Mock moduna geçer.
+    Model yoksa veya çıkarım başarısız olursa ModelUnavailableError fırlatır.
     """
+    if allow_mock is None:
+        allow_mock = os.environ.get("HEPARECIST_ALLOW_MOCK", "0") == "1"
     if not os.path.exists(input_nifti_path):
         raise FileNotFoundError(f"Girdi NIfTI dosyası bulunamadı: {input_nifti_path}")
 
@@ -86,14 +97,21 @@ def run_segmentation_inference(
                 raise RuntimeError("Maske dosyası nnU-Net tarafından üretilemedi.")
 
         except Exception as exc:
-            print(f"[WARNING] nnU-Net çıkarımı başarısız ({exc}). Güvenli Mock Modu devreye giriyor...")
+            if not allow_mock:
+                raise ModelUnavailableError(f"nnU-Net çıkarımı başarısız: {exc}") from exc
+            print(f"[TEST] nnU-Net çıkarımı başarısız ({exc}); allow_mock açık, SAHTE maske üretiliyor.")
             _generate_mock_mask(input_nifti_path, output_mask_path, lesion_label_id=lesion_label_id)
     else:
-        print(f"[INFO] Model ağırlıkları bulunamadı ({model_dir}). Test için Mock Modu aktif.")
+        if not allow_mock:
+            raise ModelUnavailableError(
+                f"Model ağırlıkları bulunamadı ({model_dir}). Gerçek hasta verisi için eğitilmiş "
+                "nnU-Net modeli gereklidir. Test için allow_mock=True / HEPARECIST_ALLOW_MOCK=1 kullanın.")
+        print(f"[TEST] Model ağırlıkları yok ({model_dir}); allow_mock açık, SAHTE maske üretiliyor.")
         _generate_mock_mask(input_nifti_path, output_mask_path, lesion_label_id=lesion_label_id)
 
     # Üretilen maskenin lezyon analizini yap
-    result = _calculate_mask_metrics(output_mask_path, lesion_label_id=lesion_label_id)
+    result = _calculate_mask_metrics(output_mask_path, lesion_label_id=lesion_label_id,
+                                     slice_thickness_mm=slice_thickness_mm)
     result["is_mock"] = is_mock
     result["output_mask_path"] = output_mask_path
 
@@ -145,71 +163,29 @@ def _generate_mock_mask(input_nifti_path: str, output_mask_path: str, lesion_lab
     sitk.WriteImage(mask_image, output_mask_path)
 
 
-def _calculate_mask_metrics(mask_path: str, lesion_label_id: int = 8) -> Dict[str, Any]:
+def _calculate_mask_metrics(mask_path: str, lesion_label_id: int = 8,
+                            slice_thickness_mm: Optional[float] = None) -> Dict[str, Any]:
     """
-    3D maskeden her bir lezyon odağını bağımsız olarak ayıklar,
-    toplam lezyon sayısını ve RECIST 1.1 hedef lezyon çapını hesaplar.
+    3D maskeden lezyon odaklarını ortak ölçüm modülüyle (lesion_geometry) çıkarır.
     """
     mask_img = sitk.ReadImage(mask_path)
-    mask_arr = sitk.GetArrayFromImage(mask_img)
-    spacing = mask_img.GetSpacing()
+    lesions, _ = extract_lesions(mask_img, lesion_label_id, slice_thickness_mm)
 
-    voxel_vol = spacing[0] * spacing[1] * spacing[2]
-
-    # Eğer belirtilen lezyon etiketi maskede yoksa lezyon tespit edilmemiştir
-    unique_vals = set(np.unique(mask_arr))
-    if lesion_label_id not in unique_vals:
-        return {
-            "detected_lesions_count": 0,
-            "total_volume_mm3": 0.0,
-            "primary_lesion_diameter_mm": 0.0,
-            "estimated_diameter_mm": 0.0,
-            "lesions": []
-        }
-
-    binary_lesions = (mask_arr == lesion_label_id)
-
-    labeled_mask, num_features = ndimage.label(binary_lesions)
-    lesion_details = []
-    total_volume_mm3 = 0.0
-
-    for r_id in range(1, num_features + 1):
-        voxels = (labeled_mask == r_id)
-        v_count = int(np.sum(voxels))
-        if v_count < 15:
-            continue
-
-        vol = v_count * voxel_vol
-        total_volume_mm3 += vol
-
-        # Aksiyel düzlemde maksimum çap hesabı (RECIST 1.1)
-        z_slices = np.unique(np.where(voxels)[0])
-        max_d = 0.0
-        for z in z_slices:
-            slice_2d = voxels[z, :, :]
-            y_pts, x_pts = np.where(slice_2d)
-            if len(x_pts) >= 2:
-                pts = np.column_stack((x_pts * spacing[0], y_pts * spacing[1]))
-                if len(pts) > 80:
-                    pts = pts[::max(1, len(pts)//40)]
-                diffs = pts[:, None, :] - pts[None, :, :]
-                dists = np.sqrt(np.sum(diffs**2, axis=-1))
-                max_d = max(max_d, float(np.max(dists)))
-
-        lesion_details.append({
-            "lesion_id": r_id,
-            "volume_mm3": round(vol, 2),
-            "axial_diameter_mm": round(max_d, 2),
-            "is_target": max_d >= 10.0
-        })
-
-    primary_diameter = max([l["axial_diameter_mm"] for l in lesion_details], default=0.0)
+    lesion_details = [{
+        "lesion_id": l["id"],
+        "organ": l["organ"],
+        "volume_mm3": l["volume_mm3"],
+        "axial_diameter_mm": l["diameter_mm"],
+        "is_measurable": l["is_measurable"],
+        "is_target": l["is_measurable"],
+    } for l in lesions]
+    primary = max((l["diameter_mm"] for l in lesions), default=0.0)
 
     return {
         "detected_lesions_count": len(lesion_details),
-        "total_volume_mm3": round(total_volume_mm3, 2),
-        "primary_lesion_diameter_mm": round(primary_diameter, 2),
-        "estimated_diameter_mm": round(primary_diameter, 2),  # main.py uyumluluğu için
+        "total_volume_mm3": round(sum(l["volume_mm3"] for l in lesions), 2),
+        "primary_lesion_diameter_mm": round(primary, 2),
+        "estimated_diameter_mm": round(primary, 2),  # main.py uyumluluğu için
         "lesions": lesion_details
     }
 

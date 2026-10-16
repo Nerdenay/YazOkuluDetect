@@ -5,8 +5,10 @@ HepaRECIST-AI - Faz 3: Radyomik Doku Doğrulama ve Güven Skoru Motoru
 - 3D Lezyon Segmentasyonu (Label 8) Doğrulama
 - HU İstatistikleri: Mean, Std, Median, P10, P25, P75, P90, IQR
 - Morfolojik Özellikler: Hacim (mm³), Fiziksel Centroid (LPS), 3D Küresellik (Sphericity Ψ)
-- Kural Tabanlı Sınıflandırma: Malign (Tümör/Metastaz), Benign (Kist), Vasküler/Kireçlenme
-- Güven Skoru (<0.75 ise Hekim Onay Kuyruğu Flag'i)
+- Kural tabanlı DANSİTE ÖN-KATEGORİSİ (tanı değildir): kistik görünümlü, solid,
+  hiperdens, belirsiz. Eşikler doğrulanmamıştır; kontrast fazı hesaba katılmaz.
+  Malign/benign ayrımı yapılmaz, sabit "güven skoru" üretilmez; her aday
+  radyolog onayına gider.
 """
 
 import os
@@ -18,30 +20,22 @@ from typing import Dict, List, Any
 
 def calculate_3d_sphericity(binary_region: np.ndarray, spacing: tuple) -> float:
     """
-    3D Küresellik (Sphericity Ψ) Katsayısını hesaplar:
-        Ψ = (π^(1/3) * (6 * Hacim)^(2/3)) / Yüzey_Alanı
-    Değer aralığı: (0, 1]. Mükemmel küre = 1.0.
+    3D Küresellik: Ψ = π^(1/3) (6V)^(2/3) / A  (mükemmel küre = 1).
+    Yüzey alanı A, SimpleITK LabelShapeStatistics 'Perimeter' (Crofton tabanlı
+    yüzey kestirimi) ile hesaplanır; voksel basamak etkisi büyük ölçüde giderilir.
     """
-    voxel_vol = spacing[0] * spacing[1] * spacing[2]
-    volume_mm3 = float(np.sum(binary_region) * voxel_vol)
-    
-    if volume_mm3 <= 0:
+    img = sitk.GetImageFromArray(binary_region.astype(np.uint8))
+    img.SetSpacing(tuple(float(s) for s in spacing))
+    stats = sitk.LabelShapeStatisticsImageFilter()
+    stats.ComputePerimeterOn()
+    stats.Execute(img)
+    if not stats.HasLabel(1):
         return 0.0
-
-    # 3D Morfolojik Gradyan / Erozyon ile yüzey piksellerini çıkar
-    eroded = ndimage.binary_erosion(binary_region)
-    surface_mask = binary_region ^ eroded
-    surface_voxel_count = int(np.sum(surface_mask))
-
-    if surface_voxel_count == 0:
-        return 1.0
-
-    # Yaklaşık yüzey alanı (mm²)
-    mean_face_area = (spacing[0]*spacing[1] + spacing[1]*spacing[2] + spacing[0]*spacing[2]) / 3.0
-    surface_area_mm2 = surface_voxel_count * mean_face_area
-
-    # Sphericity formülü
-    psi = (np.pi ** (1.0 / 3.0) * ((6.0 * volume_mm3) ** (2.0 / 3.0))) / (surface_area_mm2 + 1e-5)
+    volume = stats.GetPhysicalSize(1)
+    area = stats.GetPerimeter(1)
+    if volume <= 0 or area <= 0:
+        return 0.0
+    psi = (np.pi ** (1.0 / 3.0)) * ((6.0 * volume) ** (2.0 / 3.0)) / area
     return round(float(np.clip(psi, 0.0, 1.0)), 3)
 
 
@@ -104,8 +98,8 @@ def analyze_ct_and_mask_radiomics(ct_nifti_path: str, mask_nifti_path: str, lesi
         physical_centroid = ct_img.TransformContinuousIndexToPhysicalPoint([centroid_zyx[2], centroid_zyx[1], centroid_zyx[0]])
 
         # 3. Kural Tabanlı Sınıflandırma
-        label, confidence = _classify_region_advanced(hu_mean, hu_std, hu_iqr, sphericity, volume_mm3)
-        needs_review = confidence < 0.75
+        label = _density_category(hu_mean, hu_std, hu_iqr, sphericity)
+        needs_review = True  # Doğrulanmış sınıflandırıcı yok: her aday radyolog onayına gider
 
         regions_analysis.append({
             "region_id": region_id,
@@ -116,9 +110,8 @@ def analyze_ct_and_mask_radiomics(ct_nifti_path: str, mask_nifti_path: str, lesi
             "hu_std": round(hu_std, 1),
             "hu_iqr": round(hu_iqr, 1),
             "classification": label,
-            "confidence_score": round(confidence, 2),
             "needs_review": needs_review,
-            "explanation": _build_explanation(label, hu_mean, hu_std, sphericity, confidence)
+            "explanation": _build_explanation(label, hu_mean, hu_std, sphericity)
         })
 
     result = {
@@ -151,42 +144,22 @@ def analyze_ct_and_mask_radiomics(ct_nifti_path: str, mask_nifti_path: str, lesi
     return result
 
 
-def _classify_region_advanced(hu_mean: float, hu_std: float, hu_iqr: float, 
-                              sphericity: float, volume_mm3: float) -> tuple:
+def _density_category(hu_mean: float, hu_std: float, hu_iqr: float, sphericity: float) -> str:
     """
-    HU yoğunluğu, doku heterojenliği (IQR/Std) ve 3D Küresellik (Ψ) ile karar verir.
+    Basit dansite ön-kategorisi. TANI DEĞİLDİR; eşikler kendi verinizde
+    doğrulanmalıdır. Kontrast fazı (arteriyel / portal / geç) HU değerini değiştirir.
     """
-    # 1. Kist: Düşük HU, düşük varyasyon VE yüksek küresellik (küreye yakın sıvı kesesi)
     if hu_mean <= 22.0 and hu_std < 14.0 and sphericity >= 0.78:
-        return "Benign (Basit Kist)", 0.94
-
-    # Sınırda kist (Düşük HU ama küresellik sınırda)
-    if hu_mean <= 25.0 and hu_std < 16.0:
-        return "Benign (Olası Kist / Nekroz)", 0.72
-
-    # 2. Vasküler / Kireçlenme: Yüksek kontrastlanma
+        return "Aday: kistik görünümlü"
     if hu_mean >= 120.0:
-        return "Vasküler / Kalsifiye Odak", 0.90
-
-    # 3. Malign (Tümör / Metastaz): Karaciğerde hipodens/izodens tümöral aralık
+        return "Aday: hiperdens (vasküler/kalsifik olabilir)"
     if 25.0 <= hu_mean <= 95.0:
-        # Malign lezyonlar düzensiz kenarlıdır (düşük sphericity) ve doku içi heterojendir (yüksek IQR/Std)
-        if hu_iqr > 18.0 or hu_std > 16.0:
-            conf = 0.88 if sphericity < 0.82 else 0.76
-            return "Malign (Tümör/Metastaz)", conf
-        else:
-            # Homojen solid lezyon (Adenoma, FNH veya düşük heterojenlikli metastaz)
-            return "Solid Lezyon (Şüpheli)", 0.65
-
-    return "Belirsiz / Atipik Doku", 0.50
+        return "Aday: solid"
+    return "Aday: belirsiz dansite"
 
 
-def _build_explanation(label: str, hu_mean: float, hu_std: float, sphericity: float, confidence: float) -> str:
-    """Klinik karar gerekçesi metni."""
-    if "Kist" in label and confidence >= 0.75:
-        return f"Sıvı dansitesi ({hu_mean:.1f} HU) ve yüksek 3D küresellik (Ψ={sphericity:.2f}) basit kist lehinedir."
-    if "Vasküler" in label:
-        return f"Belirgin yüksek dansite ({hu_mean:.1f} HU) damarsal yapı veya kireçlenmeyi düşündürmektedir."
-    if "Malign" in label:
-        return f"Tümöral dansite ({hu_mean:.1f} HU), heterojen iç yapı (std={hu_std:.1f}) ve invaziv kenar (Ψ={sphericity:.2f}) malign süreç ile uyumludur."
-    return f"Dansite ({hu_mean:.1f} HU) veya şekil (Ψ={sphericity:.2f}) sınırda değerdedir. Hekim onayı önerilir."
+def _build_explanation(label: str, hu_mean: float, hu_std: float, sphericity: float) -> str:
+    """Ölçülen değerleri tarafsız biçimde özetler (yorum radyoloğa aittir)."""
+    return (f"Ortalama dansite {hu_mean:.1f} HU, standart sapma {hu_std:.1f}, "
+            f"küresellik Ψ={sphericity:.2f}. Kural tabanlı ön-kategori: {label}. "
+            "Doğrulanmamış eşikler; radyolog değerlendirmesi gereklidir.")

@@ -16,7 +16,8 @@ import SimpleITK as sitk
 
 # Proje Modülleri
 from preprocess import convert_dicom_to_nifti, resample_image, apply_windowing_for_visualization
-from inference import run_segmentation_inference
+from inference import run_segmentation_inference, ModelUnavailableError
+from recist_engine import evaluate_recist
 from radiomics_module import analyze_ct_and_mask_radiomics
 from matching_engine import run_longitudinal_analysis
 from pipeline import run_full_pipeline, run_single_timepoint_pipeline
@@ -66,8 +67,9 @@ class LongitudinalRequest(BaseModel):
 class DecisionRequest(BaseModel):
     sod_baseline: float = Field(..., ge=0, description="Tedavi başlangıç (Baseline) hedef lezyon çap toplamı (mm)")
     sod_followup: float = Field(..., ge=0, description="Takip (Follow-up) hedef lezyon çap toplamı (mm)")
-    sod_nadir: Optional[float] = Field(None, description="Takip süresince görülen en küçük SOD değeri (Nadir). Yoksa baseline alınır.")
-    new_lesion: bool = Field(False, description="Yeni lezyon tespit edildi mi?")
+    sod_nadir: Optional[float] = Field(None, description="Önceki ölçümlerdeki en küçük SOD (Nadir). Yoksa baseline alınır.")
+    new_lesion: bool = Field(False, description="Radyolog tarafından ONAYLANMIŞ yeni lezyon var mı?")
+    new_lesion_candidates: int = Field(0, ge=0, description="Onay bekleyen aday yeni lezyon sayısı")
 
 class FullPipelineRequest(BaseModel):
     baseline_dicom_dir: str
@@ -79,6 +81,8 @@ class FullPipelineRequest(BaseModel):
     study_date: str = ""
     use_llm: bool = False
     llm_api_key: str = ""
+    sod_nadir: Optional[float] = None
+    new_lesion_confirmed: bool = False
 
 class SinglePipelineRequest(BaseModel):
     dicom_dir: str
@@ -154,12 +158,21 @@ def preprocess_endpoint(request: PreprocessRequest):
 
 
 @app.post("/predict", tags=["AI Segmentasyon"])
-@app.post("/predict-mock", tags=["AI Segmentasyon"])
 def predict_endpoint(request: PredictRequest):
     """
     nnU-Net v2 ile 3D Multi-Organ ve Lezyon (Label 8) segmentasyonu çıkarımı yapar.
-    Ağırlıklar yoksa Mock moduna geçer.
+    Model yoksa 503 döner; sahte sonuç üretmez.
     """
+    return _predict(request, allow_mock=None)
+
+
+@app.post("/predict-mock", tags=["AI Segmentasyon"])
+def predict_mock_endpoint(request: PredictRequest):
+    """YALNIZCA TEST: model yoksa sahte maske üretir (is_mock=True)."""
+    return _predict(request, allow_mock=True)
+
+
+def _predict(request: PredictRequest, allow_mock):
     if not os.path.exists(request.nifti_path):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -171,7 +184,8 @@ def predict_endpoint(request: PredictRequest):
             input_nifti_path=request.nifti_path,
             output_mask_path=request.output_mask_path,
             model_dir=request.model_dir,
-            lesion_label_id=request.lesion_label_id
+            lesion_label_id=request.lesion_label_id,
+            allow_mock=allow_mock
         )
         diam = result.get("primary_lesion_diameter_mm", result.get("estimated_diameter_mm", 0.0))
         return {
@@ -185,6 +199,8 @@ def predict_endpoint(request: PredictRequest):
             "is_mock": result["is_mock"],
             "preview_image_path": result.get("preview_image_path", "")
         }
+    except ModelUnavailableError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -249,69 +265,17 @@ def longitudinal_endpoint(request: LongitudinalRequest):
 @app.post("/recist-decision", tags=["Karar Motoru"])
 def recist_decision_endpoint(request: DecisionRequest):
     """
-    Deterministik RECIST 1.1 Kural Motoru (Eisenhauer et al., 2009).
-    Nadir (tedavi süresince görülen en küçük SOD) bazlı PD kontrolü içerir.
+    RECIST 1.1 karar motoru (recist_engine.evaluate_recist; pipeline ile aynı kurallar).
+    new_lesion yalnızca radyolog onaylı yeni lezyon için True gönderilmelidir.
     """
-    nadir_val = request.sod_nadir if (request.sod_nadir is not None and request.sod_nadir > 0) else request.sod_baseline
-
-    if request.sod_baseline > 0:
-        change_from_baseline_pct = ((request.sod_followup - request.sod_baseline) / request.sod_baseline) * 100
-    else:
-        change_from_baseline_pct = 100.0 if request.sod_followup > 0 else 0.0
-
-    if nadir_val > 0:
-        change_from_nadir_pct = ((request.sod_followup - nadir_val) / nadir_val) * 100
-    else:
-        change_from_nadir_pct = 100.0 if request.sod_followup > 0 else 0.0
-
-    absolute_nadir_diff = request.sod_followup - nadir_val
-
-    # 1. Kural: Yeni Lezyon Varlığı = Kesin Progresyon (PD)
-    if request.new_lesion:
-        decision = "PD"
-        reason = "Yeni lezyon tespit edildi. Doğrudan Progresif Hastalık (PD) kararı verildi."
-
-    # 1b. Kural: Başlangıçta hedef lezyon yokken takipte yeni lezyon çıkması = PD
-    elif request.sod_baseline == 0 and request.sod_followup > 0:
-        decision = "PD"
-        reason = f"Başlangıçta lezyon yokken takipte yeni lezyon yükü (+{request.sod_followup:.1f} mm) tespit edildi (PD)."
-
-    # 1c. Kural: Başlangıçta ve takipte lezyon olmaması = CR / Lezyonsuz
-    elif request.sod_baseline == 0 and request.sod_followup == 0:
-        decision = "CR"
-        reason = "Başlangıç ve takip tetkiklerinde hedef lezyon saptanmamıştır (Tam Yanıt / Lezyonsuz)."
-    
-    # 2. Kural: Nadir'e göre en az %20 VE mutlak en az 5 mm artış = Progresyon (PD)
-    elif change_from_nadir_pct >= 20.0 and absolute_nadir_diff >= 5.0:
-        decision = "PD"
-        reason = f"Nadir ({nadir_val:.1f} mm) değerine göre %{change_from_nadir_pct:.1f} ve +{absolute_nadir_diff:.1f} mm artış tespit edildi (PD)."
-
-    # 3. Kural: Hedef lezyonların tamamen kaybolması = Tam Yanıt (CR)
-    elif request.sod_followup == 0:
-        decision = "CR"
-        reason = "Hedeflenen tüm lezyonlar tamamen kayboldu (Tam Yanıt - CR)."
-
-    # 4. Kural: Baseline'a göre en az %30 azalma = Kısmi Yanıt (PR)
-    elif change_from_baseline_pct <= -30.0:
-        decision = "PR"
-        reason = f"Baseline ({request.sod_baseline:.1f} mm) değerine göre tümör yükünde %{abs(change_from_baseline_pct):.1f} azalma tespit edildi (PR)."
-
-    # 5. Kural: Diğer durumlar = Stabil Hastalık (SD)
-    else:
-        decision = "SD"
-        reason = f"Belirgin küçülme veya progresyon kriteri karşılanmadı. Stabil durum (SD). (Değişim: %{change_from_baseline_pct:.1f})"
-
-    return {
-        "status": "success",
-        "baseline_sod": round(request.sod_baseline, 2),
-        "followup_sod": round(request.sod_followup, 2),
-        "nadir_sod": round(nadir_val, 2),
-        "change_from_baseline_pct": round(change_from_baseline_pct, 2),
-        "change_from_nadir_pct": round(change_from_nadir_pct, 2),
-        "new_lesion": request.new_lesion,
-        "decision": decision,
-        "explanation": reason
-    }
+    result = evaluate_recist(
+        sod_baseline=request.sod_baseline,
+        sod_followup=request.sod_followup,
+        sod_nadir=request.sod_nadir,
+        new_lesion_confirmed=request.new_lesion,
+        new_lesion_candidates=request.new_lesion_candidates,
+    )
+    return {"status": "success", **result}
 
 
 @app.post("/pipeline", tags=["Uçtan Uca Pipeline"])
@@ -340,9 +304,13 @@ def full_pipeline_endpoint(request: FullPipelineRequest):
             model_dir=request.model_dir,
             patient_info=patient_info,
             use_llm=request.use_llm,
-            llm_api_key=request.llm_api_key or None
+            llm_api_key=request.llm_api_key or None,
+            sod_nadir=request.sod_nadir,
+            new_lesion_confirmed=request.new_lesion_confirmed
         )
         return result
+    except ModelUnavailableError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -375,6 +343,8 @@ def single_pipeline_endpoint(request: SinglePipelineRequest):
             patient_info=patient_info
         )
         return result
+    except ModelUnavailableError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

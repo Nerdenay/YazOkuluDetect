@@ -26,6 +26,7 @@ from datetime import datetime
 import numpy as np
 import nibabel as nib
 import scipy.ndimage as ndimage
+import SimpleITK as sitk
 import gc
 import ctypes
 
@@ -67,7 +68,8 @@ except ImportError as e:
     sys.exit(1)
 
 try:
-    from prepare_nnunet_data import setup_nnunet_environment, generate_dataset_json
+    from prepare_nnunet_data import (setup_nnunet_environment, generate_dataset_json,
+                                     make_patient_level_splits)
 except ImportError as e:
     print(f"[HATA] prepare_nnunet_data.py bulunamadı: {e}")
     sys.exit(1)
@@ -90,7 +92,36 @@ ORGAN_LABEL_MAP = {
 
 # ── Yardımcı Fonksiyonlar ───────────────────────────────────────────────────
 
-def find_dicom_series_with_timepoints(root_dir: str) -> list:
+def _score_candidate_series(dirpath: str, count: int, preferred_region: str = "abdomen") -> float:
+    """
+    Doğru DICOM serisini seçmek için öncelik puanı üretir.
+    Hekim uyarısı: Kemik penceresi (yüksek kesit sayılı) yanlışlıkla seçilmemeli,
+    batın organları için 2.5 mm Abdomen (ABD) serisi seçilmelidir.
+    """
+    path_lower = dirpath.lower().replace("\\", "/")
+    score = float(count)
+
+    if preferred_region == "abdomen":
+        # Abdomen / Batın pozitif anahtar kelimeleri
+        if any(k in path_lower for k in ["abd", "abdom", "batin", "batn", "karin", "liver"]):
+            score += 20000.0
+        # Kemik / Toraks / Akciğer cezaları (kemik pencere yüksek kesit sayısıyla batını ezmesin)
+        if any(k in path_lower for k in ["kemik", "bone", "lung", "akciger", "parankim"]):
+            score -= 15000.0
+        if any(k in path_lower for k in ["scout", "surview", "topogram"]):
+            score -= 50000.0
+    elif preferred_region == "thorax":
+        if any(k in path_lower for k in ["toraks", "thorax", "lung", "akciger", "parankim"]):
+            score += 20000.0
+        if any(k in path_lower for k in ["kemik", "bone"]):
+            score -= 15000.0
+        if any(k in path_lower for k in ["scout", "surview"]):
+            score -= 50000.0
+
+    return score
+
+
+def find_dicom_series_with_timepoints(root_dir: str, preferred_region: str = "abdomen") -> list:
     root = Path(root_dir)
     selected_series = []
 
@@ -135,10 +166,13 @@ def find_dicom_series_with_timepoints(root_dir: str) -> list:
             else:
                 study_key = parts[0].lower() if parts else "t0"
 
-            if study_key not in study_groups or count > study_groups[study_key][1]:
-                study_groups[study_key] = (dirpath, count)
+            score = _score_candidate_series(dirpath, count, preferred_region=preferred_region)
+            if study_key not in study_groups or score > study_groups[study_key]["score"]:
+                study_groups[study_key] = {"dirpath": dirpath, "count": count, "score": score}
 
-        for s_key, (best_dir, count) in sorted(study_groups.items()):
+        for s_key, best_info in sorted(study_groups.items()):
+            best_dir = best_info["dirpath"]
+            count = best_info["count"]
             case_id = f"hasta_{p_idx:03d}_{s_key}"
             selected_series.append({
                 "patient_idx": p_idx,
@@ -148,9 +182,9 @@ def find_dicom_series_with_timepoints(root_dir: str) -> list:
                 "folder_name": patient_dir.name,
                 "slice_count": count
             })
-            print(f"  • {patient_dir.name} [{s_key.upper()}] -> {count} kesit ({case_id})")
+            print(f"  • {patient_dir.name} [{s_key.upper()}] -> {count} kesit ({case_id}) [Seçilen: {os.path.basename(best_dir)}]")
 
-    print(f"\n[INFO] Toplam {len(selected_series)} adet zaman serisi bulundu.\n")
+    print(f"\n[INFO] Toplam {len(selected_series)} adet zaman serisi seçildi (Bölge: {preferred_region}).\n")
     return selected_series
 
 
@@ -210,39 +244,48 @@ def run_totalsegmentator(nifti_path: str, ts_output_dir: str, fast: bool = True)
         return False
 
 
+def _resample_label_to_reference(label_path: str, ref_img: "sitk.Image") -> np.ndarray:
+    """
+    Etiket dosyasını referans görüntünün FİZİKSEL geometrisine (origin, spacing,
+    direction) en yakın komşu ile yeniden örnekler. Yönelim farkları (RAS/LPS,
+    ters kesit sırası) ve farklı kesit sayıları doğru şekilde ele alınır.
+    Dönüş: (Z, Y, X) uint8 dizi.
+    """
+    lab = sitk.ReadImage(label_path)
+    if lab.GetNumberOfComponentsPerPixel() > 1:
+        lab = sitk.VectorIndexSelectionCast(lab, 0)
+    lab = sitk.Cast(lab > 0, sitk.sitkUInt8) if lab.GetPixelID() not in (sitk.sitkUInt8,) else lab
+    out = sitk.Resample(lab, ref_img, sitk.Transform(), sitk.sitkNearestNeighbor, 0, sitk.sitkUInt8)
+    return sitk.GetArrayFromImage(out)
+
+
+def _physical_volume_ml(label_path: str) -> float:
+    img = sitk.ReadImage(label_path)
+    arr = sitk.GetArrayViewFromImage(img)
+    sp = img.GetSpacing()
+    return float((arr > 0).sum()) * sp[0] * sp[1] * sp[2] / 1000.0
+
+
 def merge_organ_and_lesion_labels(ts_output_dir: str, ref_nifti_path: str, manual_lesion_path: str, merged_mask_path: str) -> dict:
     ts_dir = Path(ts_output_dir)
     stats = {
         "liver_voxels": 0, "spleen_voxels": 0, "kidney_voxels": 0,
-        "pancreas_voxels": 0, "lesion_voxels": 0, "has_lesion": False
+        "pancreas_voxels": 0, "lesion_voxels": 0, "has_lesion": False,
+        "has_manual_lesion_mask": False, "geometry_warning": None
     }
 
     if not os.path.exists(ref_nifti_path):
         print(f"    [Birleştirme] ⚠️ Referans NIfTI bulunamadı: {ref_nifti_path}")
         return stats
 
-    ref_img = nib.load(ref_nifti_path)
-    target_shape = ref_img.shape
-    merged = np.zeros(target_shape, dtype=np.uint8)
+    ref_img = sitk.ReadImage(ref_nifti_path)
+    merged = np.zeros(sitk.GetArrayViewFromImage(ref_img).shape, dtype=np.uint8)
 
-    # 1. Organ Maskelerini Birleştir (1-7)
+    # 1. Organ maskeleri (1-7): fiziksel geometriye göre yeniden örnekleme
     for roi, label_idx in ORGAN_LABEL_MAP.items():
         roi_file = ts_dir / f"{roi}.nii.gz"
         if roi_file.exists():
-            roi_data = nib.load(str(roi_file)).get_fdata()
-            # Eğer TotalSegmentator z-downsampled hacimde çalıştıysa, orijinal kesit boyutuna geri oturt
-            if roi_data.shape != target_shape:
-                zoom_factors = [t / s for t, s in zip(target_shape, roi_data.shape)]
-                roi_data = ndimage.zoom(roi_data.astype(np.uint8), zoom_factors, order=0)
-                # Olası float yuvarlama uyuşmazlığına karşı target_shape'e tam oturt
-                if roi_data.shape != target_shape:
-                    adjusted = np.zeros(target_shape, dtype=roi_data.dtype)
-                    min_shape = tuple(min(s, t) for s, t in zip(roi_data.shape, target_shape))
-                    src_slices = tuple(slice(0, m) for m in min_shape)
-                    dst_slices = tuple(slice(0, m) for m in min_shape)
-                    adjusted[dst_slices] = roi_data[src_slices]
-                    roi_data = adjusted
-
+            roi_data = _resample_label_to_reference(str(roi_file), ref_img)
             merged[roi_data > 0] = label_idx
             vox = int(np.sum(roi_data > 0))
             if roi == "liver": stats["liver_voxels"] = vox
@@ -250,36 +293,45 @@ def merge_organ_and_lesion_labels(ts_output_dir: str, ref_nifti_path: str, manua
             elif "kidney" in roi: stats["kidney_voxels"] += vox
             elif roi == "pancreas": stats["pancreas_voxels"] = vox
 
-    # 2. Varsa Manuel Lezyon Maskesini Birleştir (Label 8)
+    # 2. Elle çizilmiş lezyon maskesi (Label 8)
     if manual_lesion_path and os.path.exists(manual_lesion_path):
-        lesion_img = nib.load(manual_lesion_path)
-        lesion_data = lesion_img.get_fdata()
-        if lesion_data.shape != target_shape:
-            zoom_factors = [t / s for t, s in zip(target_shape, lesion_data.shape)]
-            lesion_data = ndimage.zoom(lesion_data.astype(np.uint8), zoom_factors, order=0)
-            if lesion_data.shape != target_shape:
-                adjusted = np.zeros(target_shape, dtype=lesion_data.dtype)
-                min_shape = tuple(min(s, t) for s, t in zip(lesion_data.shape, target_shape))
-                src_slices = tuple(slice(0, m) for m in min_shape)
-                dst_slices = tuple(slice(0, m) for m in min_shape)
-                adjusted[dst_slices] = lesion_data[src_slices]
-                lesion_data = adjusted
-
+        stats["has_manual_lesion_mask"] = True
+        lesion_data = _resample_label_to_reference(manual_lesion_path, ref_img)
         merged[lesion_data > 0] = 8
         stats["lesion_voxels"] = int(np.sum(lesion_data > 0))
         stats["has_lesion"] = stats["lesion_voxels"] > 0
+
+        # Geometri doğrulaması: yeniden örnekleme sonrası hacim korunmalı
+        src_ml = _physical_volume_ml(manual_lesion_path)
+        sp = ref_img.GetSpacing()
+        dst_ml = stats["lesion_voxels"] * sp[0] * sp[1] * sp[2] / 1000.0
+        if src_ml > 0 and (dst_ml == 0 or abs(dst_ml - src_ml) / src_ml > 0.3):
+            stats["geometry_warning"] = (f"Lezyon hacmi hizalamada değişti ({src_ml:.2f} -> {dst_ml:.2f} mL). "
+                                         "Maske bu BT serisine ait olmayabilir veya FOV dışında kalıyor.")
+            print(f"    [UYARI] ⚠️ {stats['geometry_warning']}")
         print(f"    [Lezyon Entegre] ✅ Label 8 eklendi ({stats['lesion_voxels']:,} voxel)")
 
-    out_nii = nib.Nifti1Image(merged, ref_img.affine)
-    out_nii.set_data_dtype(np.uint8)
-    nib.save(out_nii, merged_mask_path)
+    out = sitk.GetImageFromArray(merged)
+    out.CopyInformation(ref_img)
+    sitk.WriteImage(out, merged_mask_path)
     return stats
 
 
 # ── Ana İşlem Orkestrasyonu ──────────────────────────────────────────────────
 
 def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: str = None,
-                         fast_mode: bool = True, dataset_id: int = 1, dataset_name: str = "AbdominalTumor"):
+                         fast_mode: bool = True, dataset_id: int = 1, dataset_name: str = "AbdominalTumor",
+                         include_unlabeled: bool = False, test_fraction: float = 0.2, seed: int = 42,
+                         preferred_region: str = "abdomen"):
+    """
+    include_unlabeled: False (varsayılan) ise elle lezyon maskesi OLMAYAN seriler eğitime
+        alınmaz. Lezyonu olan ama çizilmemiş bir seri, modele "lezyon = arka plan"
+        öğretir. Yalnızca gerçekten lezyonsuz olduğu radyologca bilinen seriler için
+        True yapın (veya o seriler için boş maske dosyası verin).
+    test_fraction: Hasta düzeyinde ayrılan, eğitimde hiç kullanılmayan test oranı.
+    preferred_region: 'abdomen' veya 'thorax'. Batın organları için kemik/toraks serileri yerine
+        2.5 mm Abdomen (ABD) serisine öncelik verir.
+    """
     start_time = datetime.now()
     output_path = Path(output_dir)
 
@@ -302,11 +354,12 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
     print(f"  HepaRECIST-AI: Multi-Organ & Tümör Veri Hazırlama Pipeline")
     print(f"{'='*65}")
     print(f"  Hesaplama Donanımı : {'CUDA GPU (' + gpu_name + ')' if has_cuda else '⚠️ CPU (DİKKAT: Aşırı yavaş!)'}")
+    print(f"  Hedef Anatomik Alan: {preferred_region.upper()}")
     print(f"  Kaynak DICOM       : {dicom_root}")
     print(f"  Manuel Lezyonlar   : {manual_lesions_dir if manual_lesions_dir else 'Belirtilmedi (Sadece organlar)'}")
     print(f"  Nihai Hedef        : {nnunet_paths['dataset_dir']}\n{'='*65}\n")
 
-    series_list = find_dicom_series_with_timepoints(dicom_root)
+    series_list = find_dicom_series_with_timepoints(dicom_root, preferred_region=preferred_region)
     results = []
 
     for idx, item in enumerate(series_list, 1):
@@ -334,7 +387,8 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
 
         if already_completed:
             print(f"    [RESUME] ✅ {case_id} tamamlanmış, atlanıyor.\n")
-            results.append({"id": case_id, "status": "TAMAMLANDI", "source": item["path"]})
+            results.append({"id": case_id, "status": "TAMAMLANDI", "source": item["path"],
+                            "patient_idx": item["patient_idx"]})
             continue
 
         case_start = datetime.now()
@@ -416,6 +470,24 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
         merged_label_path = str(merged_dir / f"{case_id}.nii.gz")
         t_merge = datetime.now()
         stats = merge_organ_and_lesion_labels(ts_case_dir, nifti_out, manual_lesion_file, merged_label_path)
+        if not stats["has_manual_lesion_mask"] and not include_unlabeled:
+            print(f"    [3/4] ⏭️  {case_id}: elle lezyon maskesi yok, eğitimden çıkarıldı "
+                  "(lezyonsuz olduğu biliniyorsa boş maske verin veya --include_unlabeled kullanın).\n")
+            results.append({"id": case_id, "status": "ETIKETSIZ", "patient_idx": item["patient_idx"]})
+            for pth in (merged_label_path, nifti_out):
+                if os.path.exists(pth):
+                    os.remove(pth)
+            shutil.rmtree(ts_case_dir, ignore_errors=True)
+            force_ram_cleanup()
+            continue
+        if stats.get("geometry_warning"):
+            results.append({"id": case_id, "status": "GEOMETRI_UYARI", "warning": stats["geometry_warning"]})
+            print(f"    [3/4] ❌ {case_id} geometri uyuşmazlığı nedeniyle eğitime alınmadı.\n")
+            for pth in (merged_label_path, nifti_out):
+                if os.path.exists(pth):
+                    os.remove(pth)
+            shutil.rmtree(ts_case_dir, ignore_errors=True)
+            continue
         merge_dur = int((datetime.now() - t_merge).total_seconds())
         print(f"    [3/4] ✅ Etiketler birleştirildi ({merge_dur} sn) (Karaciğer: {stats['liver_voxels']:,} | Lezyon: {stats['lesion_voxels']:,} vx)")
 
@@ -427,7 +499,8 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
             copy_dur = int((datetime.now() - t_copy).total_seconds())
             case_dur = int((datetime.now() - case_start).total_seconds())
             print(f"    [4/4] ✅ nnU-Net klasörüne aktarıldı ({copy_dur} sn - Vaka süresi: {case_dur} sn).\n")
-            results.append({"id": case_id, "status": "OK", "has_lesion": stats["has_lesion"]})
+            results.append({"id": case_id, "status": "OK", "has_lesion": stats["has_lesion"],
+                            "patient_idx": item["patient_idx"]})
         except Exception as copy_err:
             print(f"    [4/4] ❌ Dosya aktarım hatası: {copy_err}\n")
             results.append({"id": case_id, "status": "HATA", "adim": "Kopyalama"})
@@ -447,7 +520,12 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
 
     # dataset.json Üretimi
     if is_drive_connected(str(output_path)):
-        ok_count = sum(1 for r in results if r["status"] in ["OK", "TAMAMLANDI"])
+        ok_cases = [r["id"] for r in results if r["status"] in ["OK", "TAMAMLANDI"]]
+        # Hasta düzeyinde test ayrımı + çapraz doğrulama katları (aynı hastanın t0/t1
+        # serileri asla eğitim ve doğrulama/test arasında bölünmez)
+        split_info = make_patient_level_splits(
+            nnunet_paths, ok_cases, n_folds=5, test_fraction=test_fraction, seed=seed)
+        ok_count = len(split_info["train_cases"])
         labels_dict = {
             "background": 0, "liver": 1, "spleen": 2, "kidneys": 3,
             "pancreas": 4, "gallbladder": 5, "stomach": 6, "aorta": 7,
@@ -465,6 +543,10 @@ def process_all_patients(dicom_root: str, output_dir: str, manual_lesions_dir: s
         print(f"  Toplam Seri       : {len(series_list)}")
         print(f"  Başarılı          : {ok_count}")
         print(f"  Lezyonlu Seri     : {sum(1 for r in results if r.get('has_lesion'))}")
+        print(f"  Etiketsiz (çıkarıldı): {sum(1 for r in results if r['status'] == 'ETIKETSIZ')}")
+        print(f"  Geometri uyarısı  : {sum(1 for r in results if r['status'] == 'GEOMETRI_UYARI')}")
+        print(f"  Eğitim / Test     : {ok_count} seri / {len(split_info['test_cases'])} seri "
+              f"({len(split_info['test_patients'])} test hastası)")
         print(f"  Geçen Süre        : {elapsed // 60}d {elapsed % 60}s")
         print(f"  nnU-Net Raw Dizin : {nnunet_paths['dataset_dir']}\n{'='*65}\n")
 
@@ -477,6 +559,12 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_id", type=int, default=1, help="nnU-Net Dataset ID (örn: 1)")
     parser.add_argument("--dataset_name", default="AbdominalTumor", help="nnU-Net Dataset Adı")
     parser.add_argument("--full_quality", action="store_true", help="TotalSegmentator tam kalite modu")
+    parser.add_argument("--include_unlabeled", action="store_true",
+                        help="Elle lezyon maskesi olmayan serileri de eğitime al (yalnızca lezyonsuz olduğu biliniyorsa)")
+    parser.add_argument("--test_fraction", type=float, default=0.2, help="Hasta düzeyinde test oranı")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--preferred_region", default="abdomen", choices=["abdomen", "thorax"],
+                        help="Öncelikli taranacak seri tipi ('abdomen': 2.5mm ABD batın serileri, 'thorax': toraks serileri)")
 
     args = parser.parse_args()
 
@@ -487,4 +575,8 @@ if __name__ == "__main__":
         fast_mode=not args.full_quality,
         dataset_id=args.dataset_id,
         dataset_name=args.dataset_name,
+        include_unlabeled=args.include_unlabeled,
+        test_fraction=args.test_fraction,
+        seed=args.seed,
+        preferred_region=args.preferred_region,
     )
