@@ -51,17 +51,26 @@ Resampling (1mm³)   / Safe Mock         / Vasküler          Hungarian Match   
   * Her lezyon için $0.0 - 1.0$ arası Güven Skoru (Confidence Score) üretir. Skor $<0.75$ ise `needs_review = True` bayrağı ile C# arayüzündeki **Radyolog Onay Kuyruğu**'na sevk eder.
 
 #### 🎯 Faz 4: Longitudinal Registration & Hibrit Lezyon Eşleştirme Motoru
+* **`lesion_geometry.py`**:
+  * RECIST 1.1 standardına tam uyumlu olarak, her aksiyel kesiti ayrı ayrı tarar ve 2D düzlemde maksimum Feret çapını ($mm$) ve 3D hacmi ($mm^3$) hesaplar.
 * **`matching_engine.py`**:
   * **SimpleITK Registration**: Baseline ($t_0$) ve Follow-up ($t_1$) BT taramalarını Rigid (Euler3D) + B-Spline Deformable registration ile hizalar. Hasta nefes ve organ kaymaları düzeltilir.
   * **Hibrit Hungarian Algorithm**: $t_0$ ve $t_1$ lezyonlarını 3D Öklid mesafesi ($\%50$), Hacim benzerliği ($\%30$) ve Çap oranı ($\%20$) bileşik maliyet matrisi üzerinden `scipy.optimize.linear_sum_assignment` ile optimal şekilde eşleştirir.
   * Eşleşmeyen lezyonlardan **Yeni Lezyon** veya **Kaybolan Lezyon** tespiti yapar ve RECIST 1.1 SOD (Sum of Diameters) değerlerini otomatik hesaplar.
 
-#### 📝 Faz 5: Uçtan Uca Entegrasyon & Klinik Rapor Formatlayıcı
+#### 📝 Faz 5: Uçtan Uca Entegrasyon, Deterministik RECIST Karar Motoru & Raporlama
+* **`recist_engine.py`**:
+  * Eisenhauer et al. (2009) standartlarında tekil karar motoru. Hem `main.py` hem `pipeline.py` bu motoru çağırır.
+  * Nadir (tedavi süresince görülen en küçük SOD) takibi yapar.
+  * Hekim tarafından onaylanmamış aday yeni lezyonlar varsa kararı doğrudan PD yapmaz; geçici (`provisional=True`) durum bayrağı döner.
+* **`visualizer.py`**:
+  * Karaciğer konturunu arka plana çizip lezyon odaklarını radyomik sınıflarına göre (Kırmızı: Malign, Mavi: Kist, Sarı: Vasküler, Turuncu: İnceleme) renklendirir.
+  * 4D boylamsal yan yana (side-by-side) karşılaştırma paneli üretir.
 * **`report_generator.py`**:
   * **Şablon Modu (Offline)**: İnternet veya API anahtarı gerektirmeden standart onkolojik radyoloji raporu üretir.
   * **LLM Modu (Gemini API)**: Doğrulanmış metrikleri akıcı klinik dile çevirir. **LLM ASLA karar vermez**, sadece formatlama yapar.
 * **`pipeline.py`**:
-  * `run_full_pipeline()`: Preprocessing → Segmentasyon → Radiomics → Registration → Hungarian Eşleştirme → RECIST 1.1 Kararı → Rapor Üretimi adımlarını tek tıkla çalıştırır.
+  * `run_full_pipeline()`: Preprocessing → Segmentasyon → Radiomics → Registration → Hungarian Eşleştirme → RECIST 1.1 Kararı → Görselleştirme → Rapor Üretimi adımlarını tek tıkla çalıştırır.
 
 ---
 
@@ -150,8 +159,11 @@ Eğitime geçmeden önce backend ve arayüzün çalıştığını doğrulayın:
 | `prepare_nnunet_data.py` | Scalable dataset converter | `Dataset001_AbdominalTumor/`, `dataset.json`, `run_cloud_training.sh` |
 | `prepare_training_data.py` | Otomatik Batın Veri Hazırlama & Pseudo-Labeling | `01_nifti/`, `02_ts_masks/`, `03_merged_labels/` |
 | `inference.py` | nnU-Net v2 / Safe Mock inference | `baseline_mask.nii.gz`, 3D Hacim & Çap |
+| `lesion_geometry.py` | RECIST 1.1 aksiyel 2D Feret çap hesabı | Maksimum aksiyel çap ($mm$), lezyon hacmi ($mm^3$) |
 | `radiomics_module.py` | Şekil, doku, HU sınıflandırma | Malign/Benign/Vasküler + Confidence + `needs_review` |
 | `matching_engine.py` | Registration + Hungarian Algorithm | Rigid+B-Spline NIfTI, Eşleşen Lezyonlar, Otomatik SOD |
+| `recist_engine.py` | Deterministik RECIST 1.1 Karar Motoru | CR, PR, SD, PD, NE, Nadir SOD & Provisional bayrağı |
+| `visualizer.py` | 2D aksiyel ve 4D yan yana görselleştirici | `slice_preview.png`, `comparison_4d.png` |
 | `report_generator.py` | Klinik Rapor üretici | Türkçe + İngilizce Standart Radyoloji Raporu (.txt) |
 | `pipeline.py` | Uçtan uca orkestrasyon | Tüm pipeline'ı çalıştıran `run_full_pipeline()` |
 | `main.py` | FastAPI REST API (10 endpoint) | C# WPF haberleşmesi (`http://127.0.0.1:8000`) |

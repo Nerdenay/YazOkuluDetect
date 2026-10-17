@@ -70,13 +70,16 @@
 | Modül Dosyası | Temel Sorumluluk | Çıktı / Etki |
 |:---|:---|:---|
 | `preprocess.py` | DICOM → 3D NIfTI, HU Windowing, 1mm³ B-Spline Resampling | `baseline.nii.gz`, `raw_hu_baseline.nii.gz` |
-| `prepare_training_data.py` | 106 seriyi tarayıp TotalSegmentator ile 8-sınıflı batın maskeleri üretir | `01_nifti/`, `02_ts_masks/`, `03_merged_labels/` |
+| `prepare_training_data.py` | 106 seriyi tarayıp TotalSegmentator ile 8-sınıflı batın maskeleri üretir (Toraks/Abdomen ayrımı, RAM optimizasyonu) | `01_nifti/`, `02_ts_masks/`, `03_merged_labels/` |
 | `prepare_nnunet_data.py` | nnU-Net v2 dizin yapısını ve `dataset.json` dosyasını oluşturur | `nnUNet_raw/Dataset001_AbdominalTumor/` |
 | `inference.py` | nnU-Net v2 model çıkarımı yapar (Model yoksa güvenli Mock modu) | 3D lezyon maskeleri ve Feret çapları |
+| `lesion_geometry.py` | RECIST 1.1 uyumlu kesit bazlı aksiyel 2D Feret maksimum çap ve hacim hesabı | Aksiyel lezyon çapı ($mm$), 3D hacim ($mm^3$) |
 | `radiomics_module.py` | Doku yoğunluğu, küresellik ve güven skoru hesaplar | Malign/Benign ayrımı ve `needs_review` bayrağı |
 | `matching_engine.py` | B-Spline Registration + Hungarian Algorithm ile lezyon takibi | Eşleşen lezyonlar, Δ% çaplar, otomatik SOD |
+| `recist_engine.py` | Eisenhauer et al. (2009) deterministik RECIST 1.1 karar motoru | CR / PR / SD / PD yanıtı, Nadir SOD & Güvenlik kontrolü |
+| `visualizer.py` | 2D aksiyel lezyon renklendirme ve 4D yan yana boylamsal karşılaştırma | `slice_preview.png`, `comparison_4d.png` |
 | `report_generator.py` | Düzce Üniversitesi resmi hastane şablonunda radyoloji raporu üretir | Türkçe + İngilizce Standart Rapor (.txt / .pdf) |
-| `pipeline.py` | Tüm 5 adımı tek komutla orkestre eden ana boru hattı | `run_full_pipeline()` sonuç dict'i |
+| `pipeline.py` | Tüm adımları tek komutla orkestre eden ana boru hattı | `run_full_pipeline()` sonuç dict'i |
 | `main.py` | FastAPI asenkron REST API sunucusu (10 endpoint) | C# WPF masaüstü uygulamasıyla haberleşme |
 | `YazOkuluDetectUI/` | C# .NET 9.0 WPF Masaüstü İstemcisi | Çift 3D kesit görüntüleyici, DICOM meta, RECIST rozetleri |
 

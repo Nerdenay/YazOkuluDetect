@@ -102,10 +102,14 @@ Kod yapısını incelemek isteyenler için ana modüller ve işlevleri:
 |-----------|--------------------|
 | **`preprocess.py`** | DICOM → NIfTI dönüşümü, HU windowing, 1mm³ izotropik resampling. |
 | **`inference.py`** | nnU-Net v2 AI çıkarım motoru. Model ağırlıkları yoksa güvenli Mock fallback modunda çalışır. |
+| **`lesion_geometry.py`** | 3D lezyon voksellerinden RECIST 1.1 uyumlu kesit bazlı aksiyel 2D Feret maksimum çap ve hacim hesabı. |
 | **`radiomics_module.py`** | 3D lezyon adayları için Şekil, Doku (Entropi) ve HU istatistikleri çıkararak **Malign / Benign / Vasküler** ayrımı yapar ve Güven Skoru üretir. |
 | **`matching_engine.py`** | SimpleITK Rigid + B-Spline Deformable Registration ve **Hibrit Hungarian Algorithm** ile 2 zamanlı ($t_0 \leftrightarrow t_1$) lezyon takibi yapar. |
+| **`recist_engine.py`** | Eisenhauer et al. (2009) standartlarında tekil deterministik RECIST 1.1 karar motoru (CR/PR/SD/PD, Nadir takibi, aday lezyon güvenlik protokolü). |
+| **`visualizer.py`** | Aksiyel 2D kesit, lezyon renklendirme ve 4D yan yana (side-by-side) karşılaştırma paneli üreticisi. |
 | **`report_generator.py`** | Deterministik sonuçları standart onkolojik radyoloji raporu formatına dönüştürür (Şablon veya Gemini LLM modu). |
 | **`pipeline.py`** | Tüm 6 adımı orkestre eden ana iş akışı motoru (`run_full_pipeline`). |
+| **`prepare_training_data.py`** | TotalSegmentator 7 abdominal organ + lezyon (Label 8) birleştirici, Toraks/Abdomen seri ayrımı ve RAM/Drive optimizasyonları. |
 | **`prepare_nnunet_data.py`** | Herhangi bir NIfTI veri setini nnU-Net v2 formatına dönüştüren ve RunPod GPU eğitim script'ini üreten araç. |
 | **`main.py`** | Tüm modülleri dış dünyaya açan FastAPI REST API sunucusu. |
 | **`YazOkuluDetectUI/`** | C# WPF masaüstü arayüz projesi (`MainWindow.xaml` ve `MainWindow.xaml.cs`). |
@@ -119,19 +123,14 @@ Kod yapısını incelemek isteyenler için ana modüller ve işlevleri:
 * **Soru: `dotnet` komutu bulunamadı hatası alıyorum.**
   * **Cevap:** Bilgisayarınızda .NET 9.0 SDK yüklü olduğundan emin olun veya projeyi doğrudan Visual Studio 2022 ile açıp F5'e basın.
 
-
-
-
-
-
-
-
-
 ---
 
 ## 🏆 Sistem İyileştirmeleri ve Kritik Mühendislik Çözümleri
 
-* **`prepare_training_data.py`:** TotalSegmentator'ın 7 abdominal organı (Labels 1-7) ve kullanıcının etiketleyeceği lezyonların (Label 8) çakışması çözüldü. Zaman serisi takibi (`hasta_001_t0`, `hasta_001_t1`) korunarak veri sızıntısı (data leakage) engellendi.
+* **`recist_engine.py`:** `main.py` ve `pipeline.py`'ın ayrı kurallar işletmesi riski ortadan kaldırıldı; Eisenhauer et al. (2009) kuralları tek bir deterministik motorda toplandı. Nadir SOD takibi ve radyolog tarafından onaylanmamış aday yeni lezyonlar için geçici (provisional) karar mekanizması kuruldu.
+* **`lesion_geometry.py`:** Hacimsel elipsoid tahmini yerine, RECIST 1.1'in gerektirdiği gibi her aksiyel kesiti tarayarak 2D düzlemdeki gerçek en uzun Feret çapını hesaplayan geometrik motor geliştirildi.
+* **`visualizer.py`:** Karaciğer konturunu arka plana çizip lezyon odaklarını radyomik sınıflarına göre (Kırmızı: Malign, Mavi: Kist, Sarı: Vasküler, Turuncu: İnceleme) renklendiren 2D aksiyel ve 4D karşılaştırma görselleştiricisi eklendi.
+* **`prepare_training_data.py`:** TotalSegmentator'ın 7 abdominal organı (Labels 1-7) ve kullanıcının etiketleyeceği lezyonların (Label 8) çakışması çözüldü. Toraks ve Abdomen serileri ayrıştırıldı (`_abd`, `_thorax`). Google Drive FUSE kopmalarına karşı `is_drive_connected` bekçisi ve glibc `malloc_trim` ile RAM sızıntısı önleyicisi eklendi.
 * **`preprocess.py`:** SimpleITK GDCM motoruyla yönelim (LPS/RAS) ve koordinat kayıpları giderildi. nnU-Net ve TotalSegmentator'ın ihtiyacı olan Ham Hounsfield Unit (-1000 / +1000 HU) değerleri korundu.
 * **`matching_engine.py`:** B-Spline registration dönüşüm matrisi (`composite_transform`) baseline maskesine Nearest Neighbor ile uygulandı; organ kaymalarından doğan sahte "Yeni Lezyon" tespiti engellendi ve RECIST 1.1 aksiyel 2D Feret çapı devreye alındı.
 * **`radiomics_module.py`:** Analiz alanı sadece Label 8'e sınırlandı. Sıvı kistleri tümör nekrozundan ayıran 3D Küresellik (Sphericity $\Psi$) formülü eklendi.

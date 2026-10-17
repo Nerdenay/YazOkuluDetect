@@ -47,3 +47,7 @@ Desktop.ini
 .env
 *.env
 secrets.json
+
+# Kurum İçi / Hekim Kılavuzları (Yerel Kalacak Dosyalar)
+DOKTOR_ETIKETLEME_KILAVUZU.md
+
